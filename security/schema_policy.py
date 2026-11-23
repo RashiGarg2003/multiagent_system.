@@ -114,11 +114,20 @@ class SchemaPolicyValidator:
         r"(?:^|_)("
         r"email|e_?mail|phone|mobile|address|"
         r"postal_?code|zip_?code|date_?of_?birth|"
-        r"dob|personal_?id|employee_?id|"
+        r"dob|personal_?id|"
         r"customer_?name|contact_?name"
         r")(?:_|$)",
         flags=re.IGNORECASE,
     )
+
+    INTERNAL_IDENTIFIER_PATTERN = re.compile(
+    r"(?:^|_)("
+    r"employee_?id|customer_?id|product_?id|"
+    r"order_?id|supplier_?id|category_?id|"
+    r"shipper_?id|territory_?id|region_?id"
+    r")(?:_|$)",
+    flags=re.IGNORECASE,
+)
 
     AGGREGATE_EXPRESSION_TYPES = (
         exp.Sum,
@@ -760,6 +769,11 @@ class SchemaPolicyValidator:
             normalized_name
         ):
             return DataClassification.PERSONAL
+
+        if self.INTERNAL_IDENTIFIER_PATTERN.search(
+            normalized_name
+        ):
+            return DataClassification.INTERNAL
 
         return self.default_classification
 

@@ -408,47 +408,44 @@ def route_after_prompt_guard(
 # Agent 1 routing
 # ---------------------------------------------------------------------
 
+from typing import Literal
+
+
 def route_after_intent(
-    state: GraphState,
-) -> IntentRoute:
+    state: dict,
+) -> Literal["clarification", "planning"]:
     """
-    Decide what happens after Agent 1.
-
-    Routes:
-
-    - clarification:
-      Essential information is missing.
-
-    - planning:
-      A complete validated IntentResult exists.
-
-    - failure:
-      Intent processing failed or returned an invalid state.
+    Route an underspecified request to clarification.
+    Route a sufficiently specific request to planning.
     """
-
-    if has_workflow_failed(state):
-        return "failure"
-
-    intent = state.get(
-        "intent"
-    )
-
-    if intent is None:
-        return "failure"
 
     clarification_required = state.get(
         "clarification_required",
         False,
     )
 
-    if (
-        clarification_required
-        or intent.clarification_required
-    ):
+    # Normalize unexpected model/state values.
+    if isinstance(clarification_required, list):
+        clarification_required = any(
+            bool(value)
+            for value in clarification_required
+        )
+
+    elif isinstance(clarification_required, str):
+        clarification_required = (
+            clarification_required.strip().lower()
+            in {"true", "yes", "1"}
+        )
+
+    else:
+        clarification_required = bool(
+            clarification_required
+        )
+
+    if clarification_required:
         return "clarification"
 
     return "planning"
-
 
 # ---------------------------------------------------------------------
 # Agent 2 routing

@@ -830,7 +830,12 @@ class WorkflowNodes:
             clarification_required
             clarification_question
             workflow_status
+            current_node
             execution_trace
+
+        A request proceeds to planning only when the structured intent
+        contains sufficient analytical context. Otherwise, the workflow
+        asks the user for clarification before SQL generation.
         """
 
         node_name = "intent_agent"
@@ -848,18 +853,113 @@ class WorkflowNodes:
                 )
             )
 
+            if intent is None:
+                raise RuntimeError(
+                    "IntentAgent returned no IntentResult."
+                )
+
+            # ---------------------------------------------------------
+            # Deterministic clarification safeguard
+            # ---------------------------------------------------------
+            #
+            # Do not depend only on the LLM's clarification decision.
+            # Verify whether the structured intent contains enough context
+            # for planning and SQL generation.
+            #
+            # This is generalizable because it evaluates the Pydantic
+            # output fields rather than matching fixed user phrases.
+
+            has_metric = bool(
+                [
+                    metric
+                    for metric in intent.metrics
+                    if str(metric).strip()
+                ]
+            )
+
+            has_dimension = bool(
+                [
+                    dimension
+                    for dimension in intent.dimensions
+                    if str(dimension).strip()
+                ]
+            )
+
+            has_filter = bool(
+                intent.filters
+            )
+
+            has_actionable_intent = any(
+                [
+                    has_metric,
+                    has_dimension,
+                    has_filter,
+                ]
+            )
+
+            # ---------------------------------------------------------
+            # Force clarification for an underspecified request
+            # ---------------------------------------------------------
+
+            if (
+                not intent.clarification_required
+                and not has_actionable_intent
+            ):
+                intent = intent.model_copy(
+                    update={
+                        "clarification_required": True,
+                        "clarification_question": (
+                            "What metric would you like to analyze, "
+                            "and how should the results be grouped, "
+                            "filtered, or compared?"
+                        ),
+                    }
+                )
+
+            # Ensure that clarification always contains a useful question.
             if intent.clarification_required:
+                clarification_question = (
+                    intent.clarification_question
+                )
+
+                if (
+                    not isinstance(
+                        clarification_question,
+                        str,
+                    )
+                    or not clarification_question.strip()
+                ):
+                    clarification_question = (
+                        "What metric would you like to analyze, "
+                        "and how should the results be grouped, "
+                        "filtered, or compared?"
+                    )
+
+                    intent = intent.model_copy(
+                        update={
+                            "clarification_question": (
+                                clarification_question
+                            ),
+                        }
+                    )
+
                 next_status = (
                     "clarification_required"
                 )
 
+                trace_status = (
+                    "clarification_required"
+                )
+
                 trace_message = (
-                    "Intent understood, but user "
-                    "clarification is required."
+                    "Agent 1 requires additional "
+                    "analytical context."
                 )
 
             else:
                 next_status = "planning"
+
+                trace_status = "completed"
 
                 trace_message = (
                     "Intent understood and validated."
@@ -868,7 +968,7 @@ class WorkflowNodes:
             trace = add_trace_event(
                 state=state,
                 node=node_name,
-                status="completed",
+                status=trace_status,
                 message=trace_message,
             )
 
@@ -880,7 +980,9 @@ class WorkflowNodes:
                 "clarification_question": (
                     intent.clarification_question
                 ),
-                "workflow_status": next_status,
+                "workflow_status": (
+                    next_status
+                ),
                 "current_node": node_name,
                 "error_type": None,
                 "error_message": None,
@@ -888,32 +990,22 @@ class WorkflowNodes:
             }
 
         except Exception as exc:
-            return self._error_update(
+            error_update = self._error_update(
                 state=state,
                 node_name=node_name,
                 error=exc,
             )
-
+            return error_update
+    
     def clarification_node(
-        self,
-        state: GraphState,
-    ) -> dict[str, Any]:
-        """
-        Pause the workflow for user clarification.
+            self,
+            state: GraphState,
+        ) -> dict[str, Any]:
+            """
+            End the current execution with a focused follow-up question.
+            """
 
-        This node does not call an LLM. It displays the focused
-        clarification question generated by Agent 1.
-        """
-
-        node_name = "clarification"
-
-        try:
-            clarification_required = (
-                state.get(
-                    "clarification_required",
-                    False,
-                )
-            )
+            node_name = "clarification"
 
             clarification_question = (
                 state.get(
@@ -921,27 +1013,14 @@ class WorkflowNodes:
                 )
             )
 
-            if not clarification_required:
-                raise ValueError(
-                    "Clarification node was called even "
-                    "though clarification is not required."
-                )
-
             if not isinstance(
                 clarification_question,
                 str,
-            ):
-                raise ValueError(
-                    "Clarification question is missing."
-                )
-
-            cleaned_question = (
-                clarification_question.strip()
-            )
-
-            if not cleaned_question:
-                raise ValueError(
-                    "Clarification question is empty."
+            ) or not clarification_question.strip():
+                clarification_question = (
+                    "What metric would you like to analyze, "
+                    "and how should the results be grouped "
+                    "or filtered?"
                 )
 
             trace = add_trace_event(
@@ -949,15 +1028,15 @@ class WorkflowNodes:
                 node=node_name,
                 status="waiting_for_user",
                 message=(
-                    "Workflow paused for user "
-                    "clarification."
+                    "Workflow paused because additional "
+                    "analytical context is required."
                 ),
             )
 
             return {
                 "clarification_required": True,
                 "clarification_question": (
-                    cleaned_question
+                    clarification_question
                 ),
                 "workflow_status": (
                     "clarification_required"
@@ -967,13 +1046,6 @@ class WorkflowNodes:
                 "error_message": None,
                 "execution_trace": trace,
             }
-
-        except Exception as exc:
-            return self._error_update(
-                state=state,
-                node_name=node_name,
-                error=exc,
-            )
 
     def planning_node(
         self,

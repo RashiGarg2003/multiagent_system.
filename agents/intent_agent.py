@@ -27,7 +27,6 @@ from pydantic import ValidationError
 
 from models.schemas import (
     IntentResult,
-    TimePeriod,
 )
 
 
@@ -73,93 +72,257 @@ class IntentAgent:
         """
         Build the model instructions for intent extraction.
 
-        The instructions describe the required reasoning principles but
-        do not contain hardcoded database tables, columns, or mappings.
+        The instructions define semantic reasoning and clarification rules
+        without hardcoding database tables, columns, schemas, or business
+        mappings.
         """
 
         return """
-You are the Intent Understanding Agent in a multi-agent business
-data analytics system.
+        You are the Intent Understanding Agent in a multi-agent business
+        data analytics system.
 
-Your only responsibility is to understand the user's analytical
-question and return structured analytical intent.
+        Your only responsibility is to understand the user's analytical
+        question and return structured analytical intent.
 
-Determine the intent from the meaning of the complete question.
+        Determine the intent from the meaning of the complete question.
 
-Extract:
+        Extract:
 
-1. The original question.
-2. A clearer analytical version of the question.
-3. The primary analysis type.
-4. Requested business metrics.
-5. Requested dimensions or grouping concepts.
-6. Explicit filter conditions.
-7. Time-period requirements.
-8. Sorting requirements, when relevant.
-9. Result limits, when explicitly requested.
-10. Whether clarification is required.
+        1. The original question.
+        2. A clearer analytical version of the question.
+        3. The primary analysis type.
+        4. Requested business metrics.
+        5. Requested dimensions or grouping concepts.
+        6. Explicit filter conditions.
+        7. Time-period requirements.
+        8. Sorting requirements, when relevant.
+        9. Result limits, when explicitly requested.
+        10. Whether clarification is required.
+        11. One focused clarification question when required.
 
-Analysis-type meanings:
+        ANALYSIS-TYPE DEFINITIONS
 
-- aggregation:
-  Calculate totals, counts, averages, minimums, maximums, or other
-  summarized measures.
+        aggregation:
+        Calculate totals, counts, averages, minimums, maximums, or other
+        summarized measures.
 
-- comparison:
-  Compare two or more periods, categories, groups, or segments.
+        comparison:
+        Compare two or more periods, categories, groups, or segments.
 
-- trend_analysis:
-  Analyze how a measure changes across time.
+        trend_analysis:
+        Analyze how a measure changes across time.
 
-- ranking:
-  Order entities based on a metric and identify leading or trailing
-  results.
+        ranking:
+        Order entities using a metric and identify leading or trailing
+        results.
 
-- root_cause_analysis:
-  Investigate possible reasons or contributors behind an observed
-  outcome.
+        root_cause_analysis:
+        Investigate possible reasons or contributors behind an observed
+        outcome. Do not claim that causation is proven.
 
-- anomaly_detection:
-  Identify unusual observations, spikes, drops, or outliers.
+        anomaly_detection:
+        Identify unusual observations, spikes, drops, or outliers.
 
-- distribution_analysis:
-  Analyze how values are distributed across a population or range.
+        distribution_analysis:
+        Analyze how values are distributed across a population, category,
+        or numeric range.
 
-- general_analysis:
-  Use only when no more specific analysis type is supported by the
-  question.
+        general_analysis:
+        Use only when the request is meaningful and actionable but does not
+        fit a more specific analysis type.
 
-Rules:
+        Do not use general_analysis merely to avoid asking for clarification.
 
-- Use semantic understanding of the full question.
-- Do not generate SQL.
-- Do not answer the business question.
-- Do not calculate results.
-- Do not invent database tables or columns.
-- Do not assume a specific database schema.
-- Do not invent filters, dates, or business measures.
-- Preserve explicit filter values from the question.
-- Express filters using field, operator, and value.
-- Use lowercase, concise names for metrics and dimensions.
-- Extract a limit only when the user requests a specific number.
-- Extract a sort order only when ordering is relevant to the request.
-- Determine the sorting direction from the requested ranking objective.
-- A ranking that asks for leading, largest, greatest, highest, or
-  best-performing values requires descending order.
-- A ranking that asks for trailing, smallest, least, lowest, or
-  worst-performing values requires ascending order.
-- Confirm that the selected sorting direction would return the
-  requested records before producing the final structured output.
-- Use ISO date format when exact dates can be represented reliably.
-- Otherwise preserve the user's business-period expression.
-- Ask for clarification only when missing information prevents a
-  meaningful analytical request from being formed.
-- If clarification_required is false, clarification_question must
-  be null.
-- If clarification_required is true, clarification_question must
-  contain one focused question.
-- Return only JSON matching the supplied schema.
-""".strip()
+        ACTIONABILITY POLICY
+
+        A request is actionable only when enough information is available to
+        define a meaningful database analysis.
+
+        A request normally contains actionable analytical context when at
+        least one of the following is clearly identifiable:
+
+        - A business metric, such as a total, count, average, revenue,
+        quantity, price, cost, order count, or another requested measure.
+        - A dimension or entity to analyze, group, compare, list, or rank.
+        - An explicit filter condition.
+        - A meaningful time period.
+        - A comparison target.
+        - A ranking objective with a measurable target.
+        - A specific analytical calculation.
+        - A clearly defined anomaly, distribution, or root-cause target.
+
+        A result limit or sort direction alone is not sufficient if the user
+        has not identified what should be analyzed.
+
+        CLARIFICATION POLICY
+
+        Set clarification_required to true when the request does not provide
+        enough information to define a meaningful analytical operation.
+
+        Requests such as the following require clarification:
+
+        - Analyze the data.
+        - Show performance.
+        - Give me insights.
+        - Compare the results.
+        - Show the best ones.
+        - Why did it decrease?
+        - Find the problem.
+        - Tell me what happened.
+
+        These requests are vague because the requested metric, entity,
+        dimension, comparison, filter, or time period is unknown.
+
+        For an underspecified request:
+
+        - Set clarification_required to true.
+        - Keep metrics empty when no metric is known.
+        - Keep dimensions empty when no dimension is known.
+        - Do not invent filters.
+        - Do not invent dates or time periods.
+        - Do not assume that the user means revenue, sales, orders, products,
+        customers, profit, cost, or any other business concept.
+        - Do not generate a speculative rewritten question.
+        - Ask exactly one focused clarification question.
+        - Ask for the minimum information required to continue.
+        - Do not proceed using general_analysis as a fallback.
+
+        A suitable generic clarification question is:
+
+        "What metric would you like to analyze, and how should the results be
+        grouped, filtered, or compared?"
+
+        When some context is available, make the clarification question more
+        specific.
+
+        Example:
+
+        User question:
+        "Show the top five."
+
+        Correct clarification question:
+        "Which entity should be ranked, and which metric should be used to
+        identify the top five?"
+
+        Example:
+
+        User question:
+        "Why did revenue decrease?"
+
+        Correct clarification question:
+        "Which time period, region, product, or category should be examined
+        for the revenue decrease?"
+
+        Do not ask for clarification when the request is already actionable.
+
+        Examples that normally do not require clarification:
+
+        - Show total revenue by product category.
+        - Show the top five products by revenue.
+        - Count orders by country.
+        - Show the monthly order trend.
+        - List discontinued products.
+        - Show orders placed in 1997.
+        - Compare revenue between 1996 and 1997.
+
+        GENERAL EXTRACTION RULES
+
+        Use semantic understanding of the complete question.
+
+        Do not generate SQL.
+
+        Do not answer the business question.
+
+        Do not calculate results.
+
+        Do not invent database tables or columns.
+
+        Do not assume a specific database schema.
+
+        Do not invent metrics, dimensions, filters, dates, or business
+        measures.
+
+        Preserve explicit filter values from the question.
+
+        Express each filter using:
+
+        - field
+        - operator
+        - value
+
+        Use lowercase, concise, business-level names for metrics and
+        dimensions.
+
+        Keep metrics and dimensions separate:
+
+        - A metric is a value being calculated or measured.
+        - A dimension is an entity or category used to group, compare, list,
+        or rank results.
+
+        Extract a limit only when the user explicitly requests a specific
+        number.
+
+        Extract a sort order only when ordering is relevant.
+
+        Determine sorting direction from the ranking objective:
+
+        - Leading, largest, greatest, highest, top, or best-performing values
+        require descending order.
+        - Trailing, smallest, least, lowest, bottom, or worst-performing values
+        require ascending order.
+
+        Confirm that the selected sorting direction would return the records
+        requested by the user.
+
+        Use ISO date format when exact dates can be represented reliably.
+
+        Otherwise, preserve the user's business-period expression without
+        inventing exact dates.
+
+        ROOT-CAUSE REQUESTS
+
+        A root-cause request must identify an observed outcome to investigate.
+
+        For example:
+
+        - "Why did revenue decrease in 1997?" is actionable.
+        - "Why did it decrease?" requires clarification.
+
+        Represent root-cause requests as investigations of possible drivers.
+        Do not state or imply that the available data will prove causality.
+
+        OUTPUT CONSISTENCY RULES
+
+        When clarification_required is false:
+
+        - clarification_question must be null.
+        - The structured intent must contain sufficient analytical context.
+        - Do not return empty metrics, empty dimensions, empty filters, no time
+        period, no ranking target, and no other analytical information at
+        the same time.
+
+        When clarification_required is true:
+
+        - clarification_question must contain exactly one focused question.
+        - Do not populate missing fields with assumptions.
+        - The rewritten question must describe the unresolved analytical need
+        without pretending that the missing information is known.
+
+        Before returning the result, verify:
+
+        1. Is the requested analytical outcome clear?
+        2. Is at least one meaningful metric, dimension, filter, time period,
+        comparison, ranking target, or calculation identifiable?
+        3. Would a planning agent know what analysis to plan without inventing
+        business requirements?
+        4. Would a SQL-generation agent know what kind of result is expected
+        without guessing the user's objective?
+
+        If the answer to questions 1, 3, or 4 is no, set
+        clarification_required to true.
+
+        Return only JSON matching the supplied schema.
+        """.strip()
 
     def _build_user_prompt(
         self,
@@ -250,8 +413,7 @@ Do not include Markdown, commentary, SQL, or an analytical answer.
         """
         Validate the model response using IntentResult.
 
-        No rule-based correction is applied. Invalid output is rejected
-        instead of being silently modified.
+        Invalid output is rejected instead of being silently modified.
         """
 
         try:
@@ -266,6 +428,93 @@ Do not include Markdown, commentary, SQL, or an analytical answer.
                 f"Raw model output:\n{raw_content}\n\n"
                 f"Validation error:\n{exc}"
             ) from exc
+
+    def _enforce_clarification_policy(
+        self,
+        result: IntentResult,
+    ) -> IntentResult:
+        """
+        Enforce a general, schema-driven clarification policy.
+
+        A request cannot proceed to planning and SQL generation unless
+        IntentResult contains enough information to define an analytical
+        operation.
+
+        This does not use hardcoded business keywords. It validates the
+        structured intent produced by the model.
+        """
+
+        if not isinstance(
+            result,
+            IntentResult,
+        ):
+            raise TypeError(
+                "result must be an IntentResult instance."
+            )
+
+        metrics = [
+            str(metric).strip()
+            for metric in result.metrics
+            if str(metric).strip()
+        ]
+
+        dimensions = [
+            str(dimension).strip()
+            for dimension in result.dimensions
+            if str(dimension).strip()
+        ]
+
+        has_metric = bool(metrics)
+        has_dimension = bool(dimensions)
+        has_meaningful_filter = any(
+            isinstance(filter_condition, object)
+            and bool(str(filter_condition.field).strip())
+            and bool(str(filter_condition.operator).strip())
+            and filter_condition.value not in (None, "", [], {})
+            for filter_condition in result.filters
+        )
+        has_actionable_context = (
+            has_metric
+            or has_dimension
+            or has_meaningful_filter
+        )
+
+        if has_actionable_context:
+            return result.model_copy(
+                update={
+                    "clarification_required": False,
+                    "clarification_question": None,
+                    "metrics": metrics,
+                    "dimensions": dimensions,
+                }
+            )
+
+        clarification_question = (
+            result.clarification_question
+        )
+
+        if (
+            not isinstance(
+                clarification_question,
+                str,
+            )
+            or not clarification_question.strip()
+        ):
+            clarification_question = (
+                "What metric would you like to analyze, "
+                "and how should the results be grouped or filtered?"
+            )
+
+        return result.model_copy(
+            update={
+                "clarification_required": True,
+                "clarification_question": (
+                    clarification_question
+                ),
+                "metrics": metrics,
+                "dimensions": dimensions,
+            }
+        )
 
     def understand(
         self,
@@ -308,37 +557,6 @@ Do not include Markdown, commentary, SQL, or an analytical answer.
                 "The user question cannot be empty."
             )
 
-        normalized_question = (
-            cleaned_question.lower().strip()
-            .rstrip(".!?")
-        )
-        incomplete_phrases = {
-            "analyze",
-            "analyze the results",
-            "analyse",
-            "analyse the results",
-            "give me insights",
-            "show me the data",
-        }
-
-        if normalized_question in incomplete_phrases:
-            return IntentResult(
-                original_question=cleaned_question,
-                rewritten_question=cleaned_question,
-                analysis_type="general_analysis",
-                metrics=[],
-                dimensions=[],
-                filters=[],
-                time_period=TimePeriod(),
-                sort_order=None,
-                limit=None,
-                clarification_required=True,
-                clarification_question=(
-                    "Which metric and dimension would you like "
-                    "me to analyze?"
-                ),
-            )
-
         raw_content = self._call_model(
             user_question=cleaned_question
         )
@@ -347,7 +565,9 @@ Do not include Markdown, commentary, SQL, or an analytical answer.
             raw_content=raw_content
         )
 
-        return result
+        return self._enforce_clarification_policy(
+            result=result
+        )
 
 
 def main() -> None:

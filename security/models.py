@@ -989,8 +989,10 @@ class BenchmarkExample(SecurityModel):
     expected_final_status: Literal[
         "completed",
         "clarification_required",
-        "blocked",
-        "review",
+        "security_blocked",
+        "security_review_required",
+        "output_blocked",
+        "output_review_required",
         "failed",
     ]
 

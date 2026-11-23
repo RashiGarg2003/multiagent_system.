@@ -39,6 +39,7 @@ import os
 from typing import Any
 
 import pandas as pd
+import plotly.express as px
 import requests
 import streamlit as st
 
@@ -47,6 +48,397 @@ from models.schemas import (
     QueryExecutionResult,
 )
 from tools.chart_tool import ChartTool
+
+# =========================================================
+# Result table and visualization helpers
+# =========================================================
+
+def format_column_name(column_name: str) -> str:
+    """
+    Convert database-style column names into readable labels.
+
+    Example:
+        orders_count -> Orders Count
+        total_revenue -> Total Revenue
+    """
+    return str(column_name).replace("_", " ").strip().title()
+
+
+def convert_result_to_dataframe(result_data) -> pd.DataFrame:
+    """
+    Safely convert different API result formats into a DataFrame.
+    """
+
+    if result_data is None:
+        return pd.DataFrame()
+
+    if isinstance(result_data, pd.DataFrame):
+        return result_data.copy()
+
+    if isinstance(result_data, list):
+        return pd.DataFrame(result_data)
+
+    if isinstance(result_data, dict):
+        # Format:
+        # {
+        #     "columns": ["Country", "orders_count"],
+        #     "rows": [["USA", 2280], ["France", 1909]]
+        # }
+        columns = result_data.get("columns")
+        rows = result_data.get("rows")
+
+        if columns and isinstance(rows, list):
+            return pd.DataFrame(rows, columns=columns)
+
+        # Other common API keys
+        for key in [
+            "data",
+            "results",
+            "records",
+            "result",
+            "query_results",
+        ]:
+            nested_data = result_data.get(key)
+
+            if isinstance(nested_data, list):
+                return pd.DataFrame(nested_data)
+
+    return pd.DataFrame()
+
+
+def prepare_display_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prepare the SQL result for clean Streamlit display.
+    """
+
+    if dataframe is None or dataframe.empty:
+        return pd.DataFrame()
+
+    display_df = dataframe.copy()
+
+    # Convert numeric-looking object columns into numeric columns.
+    for column in display_df.columns:
+        if display_df[column].dtype == "object":
+            converted_column = pd.to_numeric(
+                display_df[column],
+                errors="coerce",
+            )
+
+            original_non_null = display_df[column].notna().sum()
+            converted_non_null = converted_column.notna().sum()
+
+            if (
+                original_non_null > 0
+                and original_non_null == converted_non_null
+            ):
+                display_df[column] = converted_column
+
+    # Clean database-style column names.
+    display_df.columns = [
+        format_column_name(column)
+        for column in display_df.columns
+    ]
+
+    return display_df
+
+
+def build_result_column_config(
+    dataframe: pd.DataFrame,
+) -> dict:
+    """
+    Create Streamlit column formatting dynamically.
+    """
+
+    column_config = {}
+
+    for column in dataframe.columns:
+        if pd.api.types.is_integer_dtype(dataframe[column]):
+            column_config[column] = st.column_config.NumberColumn(
+                column,
+                format="%d",
+                width="medium",
+            )
+
+        elif pd.api.types.is_float_dtype(dataframe[column]):
+            column_lower = column.lower()
+
+            if any(
+                keyword in column_lower
+                for keyword in [
+                    "revenue",
+                    "sales",
+                    "amount",
+                    "value",
+                    "price",
+                    "cost",
+                    "total",
+                ]
+            ):
+                column_config[column] = (
+                    st.column_config.NumberColumn(
+                        column,
+                        format="%.2f",
+                        width="medium",
+                    )
+                )
+            else:
+                column_config[column] = (
+                    st.column_config.NumberColumn(
+                        column,
+                        format="%.2f",
+                        width="medium",
+                    )
+                )
+
+        else:
+            column_config[column] = st.column_config.TextColumn(
+                column,
+                width="medium",
+            )
+
+    return column_config
+
+
+def detect_date_column(
+    dataframe: pd.DataFrame,
+) -> str | None:
+    """
+    Detect a likely date/month/year column.
+    """
+
+    date_keywords = [
+        "date",
+        "month",
+        "year",
+        "quarter",
+        "week",
+        "day",
+        "period",
+    ]
+
+    for column in dataframe.columns:
+        column_lower = str(column).lower()
+
+        if any(
+            keyword in column_lower
+            for keyword in date_keywords
+        ):
+            converted = pd.to_datetime(
+                dataframe[column],
+                errors="coerce",
+            )
+
+            if converted.notna().sum() > 0:
+                return column
+
+    return None
+
+
+def build_fallback_chart(
+    dataframe: pd.DataFrame,
+):
+    """
+    Build a deterministic Plotly chart when the backend or
+    visualization agent does not return a valid chart.
+
+    Rules:
+    1. Date + numeric column -> line chart
+    2. Categorical + numeric column -> horizontal bar chart
+    3. Two numeric columns -> scatter chart
+    """
+
+    if dataframe is None or dataframe.empty:
+        return None
+
+    chart_df = dataframe.copy()
+
+    # Ensure numeric-looking values have numeric data types.
+    for column in chart_df.columns:
+        if chart_df[column].dtype == "object":
+            converted_column = pd.to_numeric(
+                chart_df[column],
+                errors="coerce",
+            )
+
+            original_non_null = chart_df[column].notna().sum()
+            converted_non_null = converted_column.notna().sum()
+
+            if (
+                original_non_null > 0
+                and original_non_null == converted_non_null
+            ):
+                chart_df[column] = converted_column
+
+    numeric_columns = (
+        chart_df
+        .select_dtypes(include="number")
+        .columns
+        .tolist()
+    )
+
+    categorical_columns = [
+        column
+        for column in chart_df.columns
+        if column not in numeric_columns
+    ]
+
+    date_column = detect_date_column(chart_df)
+
+    # -----------------------------------------------------
+    # Date/time plus numeric value: line chart
+    # -----------------------------------------------------
+    if date_column and numeric_columns:
+        value_column = numeric_columns[0]
+
+        chart_df[date_column] = pd.to_datetime(
+            chart_df[date_column],
+            errors="coerce",
+        )
+
+        chart_df = (
+            chart_df[
+                [date_column, value_column]
+            ]
+            .dropna()
+            .sort_values(date_column)
+        )
+
+        if chart_df.empty:
+            return None
+
+        figure = px.line(
+            chart_df,
+            x=date_column,
+            y=value_column,
+            markers=True,
+            title=(
+                f"{format_column_name(value_column)} "
+                f"Trend"
+            ),
+            labels={
+                date_column: format_column_name(date_column),
+                value_column: format_column_name(value_column),
+            },
+        )
+
+        figure.update_layout(
+            height=460,
+            margin=dict(
+                l=20,
+                r=20,
+                t=70,
+                b=20,
+            ),
+            hovermode="x unified",
+        )
+
+        return figure
+
+    # -----------------------------------------------------
+    # Category plus numeric value: horizontal bar chart
+    # -----------------------------------------------------
+    if categorical_columns and numeric_columns:
+        category_column = categorical_columns[0]
+        value_column = numeric_columns[0]
+
+        chart_df = (
+            chart_df[
+                [category_column, value_column]
+            ]
+            .dropna()
+            .sort_values(
+                value_column,
+                ascending=True,
+            )
+        )
+
+        # Keep the chart readable.
+        # For top-N results, retain the largest 30 values.
+        if len(chart_df) > 30:
+            chart_df = chart_df.tail(30)
+
+        if chart_df.empty:
+            return None
+
+        figure = px.bar(
+            chart_df,
+            x=value_column,
+            y=category_column,
+            orientation="h",
+            text=value_column,
+            title=(
+                f"{format_column_name(value_column)} "
+                f"by {format_column_name(category_column)}"
+            ),
+            labels={
+                category_column: format_column_name(
+                    category_column
+                ),
+                value_column: format_column_name(
+                    value_column
+                ),
+            },
+        )
+
+        figure.update_traces(
+            texttemplate="%{text:,.0f}",
+            textposition="outside",
+            cliponaxis=False,
+        )
+
+        figure.update_layout(
+            height=max(
+                430,
+                min(850, len(chart_df) * 34),
+            ),
+            margin=dict(
+                l=20,
+                r=60,
+                t=70,
+                b=20,
+            ),
+            yaxis=dict(
+                categoryorder="total ascending",
+            ),
+            showlegend=False,
+        )
+
+        return figure
+
+    # -----------------------------------------------------
+    # Two numeric values: scatter chart
+    # -----------------------------------------------------
+    if len(numeric_columns) >= 2:
+        x_column = numeric_columns[0]
+        y_column = numeric_columns[1]
+
+        figure = px.scatter(
+            chart_df,
+            x=x_column,
+            y=y_column,
+            title=(
+                f"{format_column_name(y_column)} versus "
+                f"{format_column_name(x_column)}"
+            ),
+            labels={
+                x_column: format_column_name(x_column),
+                y_column: format_column_name(y_column),
+            },
+        )
+
+        figure.update_layout(
+            height=460,
+            margin=dict(
+                l=20,
+                r=20,
+                t=70,
+                b=20,
+            ),
+        )
+
+        return figure
+
+    return None
 
 
 # ---------------------------------------------------------------------
@@ -89,7 +481,17 @@ MODELS_ENDPOINT = (
 API_CONNECTION_TIMEOUT_SECONDS = 10
 
 # Local LLM workflows can take several minutes.
-API_WORKFLOW_TIMEOUT_SECONDS = 600
+# This can be overridden by the STREAMLIT_WORKFLOW_TIMEOUT_SECONDS
+# environment variable for slower machines or larger prompts.
+API_WORKFLOW_TIMEOUT_SECONDS = max(
+    600,
+    int(
+        os.getenv(
+            "STREAMLIT_WORKFLOW_TIMEOUT_SECONDS",
+            "1800",
+        )
+    ),
+)
 
 MAX_SQL_RETRIES = 3
 MAXIMUM_CHART_ROWS = 100
@@ -475,84 +877,96 @@ def display_chart(
         )
     )
 
-    if chart is None:
-        return
-
-    st.subheader(
-        "Visualization"
-    )
+    st.subheader("Visualization")
 
     if query_result is None:
         st.warning(
             "The API response does not contain "
             "query-result data for charting."
         )
-
         return
 
-    try:
-        render_result = (
-            get_chart_tool().render(
+    visualization_df = create_result_dataframe(
+        api_response
+    )
+
+    if chart is not None:
+        try:
+            render_result = get_chart_tool().render(
                 chart_specification=chart,
                 query_result=query_result,
             )
+
+            if render_result.figure is not None:
+                st.plotly_chart(
+                    render_result.figure,
+                    use_container_width=True,
+                    key="analytics_chart",
+                )
+
+                if render_result.warnings:
+                    with st.expander(
+                        "Chart notes",
+                        expanded=False,
+                    ):
+                        for warning in render_result.warnings:
+                            st.warning(warning)
+                return
+
+        except Exception as exc:
+            st.caption(
+                f"Requested chart could not be rendered: {exc}"
+            )
+
+    if visualization_df.empty:
+        st.info(
+            "No visualization can be generated because "
+            "the query did not return rows."
         )
-
-    except Exception as exc:
-        st.warning(
-            "The chart could not be rendered."
-        )
-
-        st.caption(str(exc))
-
         return
 
-    if render_result.figure is not None:
-        st.plotly_chart(
-            render_result.figure,
-            use_container_width=True,
-            key="analytics_chart",
+    numeric_columns = (
+        visualization_df
+        .select_dtypes(include="number")
+        .columns
+        .tolist()
+    )
+    non_numeric_columns = [
+        column
+        for column in visualization_df.columns
+        if column not in numeric_columns
+    ]
+    result_is_chartable = bool(
+        numeric_columns
+        and (
+            non_numeric_columns
+            or len(numeric_columns) >= 2
         )
+    )
 
+    if not result_is_chartable:
+        st.info(
+            "The returned result does not contain numeric data "
+            "that can be visualized."
+        )
+        return
+
+    fallback_figure = build_fallback_chart(
+        visualization_df
+    )
+    if fallback_figure is not None:
+        st.plotly_chart(
+            fallback_figure,
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+                "responsive": True,
+            },
+        )
     else:
         st.info(
-            "No visualization is required for "
-            "this result."
-        )
-
-    if render_result.warnings:
-        with st.expander(
-            "Chart notes",
-            expanded=False,
-        ):
-            for warning in (
-                render_result.warnings
-            ):
-                st.warning(warning)
-
-
-def display_key_findings(
-    api_response: dict[str, Any],
-) -> None:
-    """
-    Display final key findings.
-    """
-
-    findings = api_response.get(
-        "key_findings",
-        [],
-    )
-
-    if not findings:
-        return
-
-    st.subheader(
-        "Key Findings"
-    )
-
-    for finding in findings:
-        st.markdown(
-            f"- {finding}"
+            "No suitable chart could be generated from "
+            "the returned columns."
         )
 
 
@@ -738,11 +1152,48 @@ def display_query_results(
         api_response
     )
 
+    display_df = prepare_display_dataframe(
+        dataframe
+    )
+
+    if display_df.empty:
+        st.info("The query did not return any data rows.")
+        return
+
+    table_header_col, table_control_col = st.columns(
+        [4, 1]
+    )
+
+    with table_control_col:
+        show_all_rows = st.toggle(
+            "Show all",
+            value=len(display_df) <= 20,
+            key="show_all_query_result_rows",
+        )
+
+    if show_all_rows:
+        visible_df = display_df
+    else:
+        visible_df = display_df.head(10)
+
     st.dataframe(
-        dataframe,
+        visible_df,
         use_container_width=True,
         hide_index=True,
+        height=min(
+            600,
+            38 * (len(visible_df) + 1),
+        ),
+        column_config=build_result_column_config(
+            visible_df
+        ),
     )
+
+    if not show_all_rows and len(display_df) > 10:
+        st.caption(
+            f"Showing 10 of {len(display_df):,} rows. "
+            "Enable “Show all” to view the complete result."
+        )
 
 
 # ---------------------------------------------------------------------
@@ -1038,10 +1489,83 @@ def display_clarification_response(
             f"### {clarification_question}"
         )
 
-    st.info(
-        "Update the business question above and "
-        "submit it again."
+    original_question = api_response.get(
+        "question",
+        st.session_state.get(
+            "last_question",
+            "",
+        ),
     )
+
+    with st.form(
+        "clarification_answer_form",
+        clear_on_submit=True,
+    ):
+        clarification_answer = st.text_area(
+            "Provide the missing information",
+            height=100,
+            placeholder=(
+                "Enter the metric, dimensions, filters, "
+                "or time period needed to continue."
+            ),
+        )
+
+        answer_submitted = st.form_submit_button(
+            "Continue analysis",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if answer_submitted:
+        cleaned_answer = clarification_answer.strip()
+
+        if not cleaned_answer:
+            st.warning(
+                "Please enter the requested information."
+            )
+        else:
+            combined_question = (
+                f"{original_question}\n\n"
+                f"Clarification answer: {cleaned_answer}"
+            )
+
+            st.session_state[
+                "last_question"
+            ] = combined_question
+
+            with st.spinner(
+                "Running the analysis with "
+                "the added clarification..."
+            ):
+                try:
+                    revised_response = (
+                        submit_analytics_question(
+                            question=combined_question,
+                            include_technical_details=(
+                                st.session_state[
+                                    "include_technical_details"
+                                ]
+                            ),
+                        )
+                    )
+
+                    st.session_state[
+                        "api_response"
+                    ] = revised_response
+
+                    st.session_state[
+                        "api_error"
+                    ] = None
+
+                    st.rerun()
+
+                except Exception as exc:
+                    st.session_state[
+                        "api_error"
+                    ] = str(exc)
+                    st.session_state[
+                        "api_response"
+                    ] = None
 
     display_technical_details(
         api_response

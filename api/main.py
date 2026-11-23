@@ -112,6 +112,8 @@ WORKFLOW_SEMAPHORE = asyncio.Semaphore(1)
 # Application lifecycle
 # ---------------------------------------------------------------------
 
+mcp_http_app = None
+
 @asynccontextmanager
 async def lifespan(
     application: FastAPI,
@@ -143,7 +145,13 @@ async def lifespan(
         application.state.services = None
         application.state.startup_error = str(exc)
 
-    yield
+    if mcp_http_app is not None:
+        async with mcp_http_app.router.lifespan_context(
+            mcp_http_app
+        ):
+            yield
+    else:
+        yield
 
     clear_dependency_caches()
 
@@ -187,6 +195,19 @@ app.add_middleware(
         "Accept",
     ],
 )
+
+
+# ---------------------------------------------------------------------
+# Model Context Protocol
+# ---------------------------------------------------------------------
+
+# Mount the MCP streamable-HTTP transport alongside the FastAPI API.
+# The MCP server remains independently runnable over stdio via:
+# python mcp_server.py
+from mcp_server import create_mcp_server
+
+mcp_http_app = create_mcp_server().streamable_http_app()
+app.mount("/mcp", mcp_http_app)
 
 
 # ---------------------------------------------------------------------
@@ -667,6 +688,16 @@ def build_output_quality_response(
             and output_guard_result
             .sanitized_payload
             is not None
+        ),
+        issues=(
+            list(
+                deterministic_result.issues
+            )
+            if isinstance(
+                deterministic_result,
+                DeterministicValidationResult,
+            )
+            else []
         ),
         message=state.get(
             "output_validation_message"

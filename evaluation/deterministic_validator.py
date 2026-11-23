@@ -1161,6 +1161,22 @@ class DeterministicOutputValidator:
                         else self.numeric_tolerance
                     )
 
+                    if not is_percentage:
+                        decimal_part = (
+                            raw_number.partition(".")[2]
+                        )
+                        display_rounding_tolerance = (
+                            0.5
+                            * (
+                                10
+                                ** -len(decimal_part)
+                            )
+                        )
+                        tolerance = max(
+                            tolerance,
+                            display_rounding_tolerance,
+                        )
+
                     matching_evidence = [
                         (
                             metric_name,

@@ -860,6 +860,38 @@ def display_business_summary(
     st.write(summary)
 
 
+def display_key_findings(
+    api_response: dict[str, Any],
+) -> None:
+    """
+    Display the main evidence-based findings.
+    """
+
+    findings = api_response.get(
+        "key_findings",
+        [],
+    )
+
+    if not isinstance(
+        findings,
+        list,
+    ) or not findings:
+        return
+
+    st.subheader(
+        "Key Findings"
+    )
+
+    for finding in findings:
+        if isinstance(
+            finding,
+            str,
+        ) and finding.strip():
+            st.markdown(
+                f"- {finding}"
+            )
+
+
 def display_chart(
     api_response: dict[str, Any],
 ) -> None:
@@ -1692,7 +1724,7 @@ def display_review_required_response(
     if deterministic_decision == "regenerate":
         st.warning(
             "The generated report failed output-quality checks "
-            "and requires regeneration."
+            "and requires regeneration or review."
         )
     else:
         st.warning(
@@ -1701,11 +1733,10 @@ def display_review_required_response(
         )
 
     # Display security message and categories
-    if isinstance(security, dict):
-        message = security.get("message")
+    security_message = None
 
-        if message:
-            st.write(message)
+    if isinstance(security, dict):
+        security_message = security.get("message")
 
         categories = security.get(
             "risk_categories",
@@ -1721,9 +1752,22 @@ def display_review_required_response(
     # Display output-quality information
     if isinstance(output_quality, dict):
         quality_message = output_quality.get("message")
+        issues = output_quality.get("issues")
 
-        if quality_message:
+        if (
+            quality_message
+            and quality_message != security_message
+        ):
             st.write(quality_message)
+
+        if (
+            deterministic_decision == "regenerate"
+            and isinstance(issues, list)
+            and issues
+        ):
+            st.markdown("**Checks that failed:**")
+            for issue in issues:
+                st.write(f"- {issue}")
 
         st.caption(
             "Output validation decision: "
@@ -1734,6 +1778,11 @@ def display_review_required_response(
 
         # Temporary debugging information
         with st.expander("Output quality details"):
+            if issues:
+                st.markdown("**Checks that failed:**")
+                for issue in issues:
+                    st.write(f"- {issue}")
+
             st.json(output_quality)
 
         

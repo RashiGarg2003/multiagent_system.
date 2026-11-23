@@ -77,7 +77,8 @@ Complete workflow:
 
 All database access remains read-only.
 
-Output regeneration is not connected yet. A regenerate decision currently
+Output regeneration is bounded by the configured retry limit. A regenerate
+decision retries report generation when capacity remains; otherwise it
 produces output_review_required and safely ends the workflow.
 """
 
@@ -462,8 +463,12 @@ def build_graph(
             # leakage, or another blocking condition.
             "output_block": END,
 
+            # Retry report generation within the configured bound.
+            "regenerate_report": (
+                "reporting_agent"
+            ),
+
             # The report needs correction or human review.
-            # Bounded regeneration will be connected later.
             "output_review": END,
 
             # Technical validator failure.

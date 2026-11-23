@@ -59,6 +59,7 @@ Reporting Agent:
 Deterministic Output Validation:
     - llm_evaluation
     - output_block
+    - regenerate_report
     - output_review
     - failure
 
@@ -176,6 +177,7 @@ ReportingRoute = Literal[
 DeterministicValidationRoute = Literal[
     "llm_evaluation",
     "output_block",
+    "regenerate_report",
     "output_review",
     "failure",
 ]
@@ -786,10 +788,16 @@ def route_after_deterministic_validation(
     ):
         return "output_block"
 
-    if decision in {
-        "regenerate",
-        "review",
-    }:
+    if decision == "regenerate":
+        if (
+            state.get("report_regeneration_count", 0)
+            < state.get("max_report_regenerations", 0)
+        ):
+            return "regenerate_report"
+
+        return "output_review"
+
+    if decision == "review":
         return "output_review"
 
     if (

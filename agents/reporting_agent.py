@@ -293,6 +293,7 @@ Return only JSON matching the supplied FinalReport schema.
         intent: IntentResult,
         analysis_result: AnalysisResult,
         query_result: QueryExecutionResult,
+        validation_issues: list[str] | None = None,
     ) -> str:
         """
         Build an evidence-grounded reporting prompt.
@@ -310,6 +311,24 @@ Return only JSON matching the supplied FinalReport schema.
             ensure_ascii=False,
             default=str,
         )
+
+        regeneration_guidance = ""
+
+        if validation_issues:
+            regeneration_guidance = (
+                "\n\nQUALITY-CHECK FEEDBACK FROM THE PREVIOUS "
+                "REPORT:\n\n"
+                + "\n".join(
+                    f"- {issue}"
+                    for issue in validation_issues
+                )
+                + (
+                    "\n\nCorrect every listed issue. Do not repeat "
+                    "unsupported numerical values, and use cautious "
+                    "observational language instead of definitive "
+                    "causal claims."
+                )
+            )
 
         return f"""
 Create the final business report for the following analytical request.
@@ -344,6 +363,7 @@ Requirements:
 8. Do not generate SQL.
 9. Do not invent values.
 10. Return only JSON matching the FinalReport schema.
+{regeneration_guidance}
 """.strip()
 
     def _call_model(
@@ -614,6 +634,7 @@ Requirements:
         intent: IntentResult,
         analysis_result: AnalysisResult,
         query_result: QueryExecutionResult,
+        validation_issues: list[str] | None = None,
     ) -> FinalReport:
         """
         Create a validated business report.
@@ -650,6 +671,14 @@ Requirements:
                 "QueryExecutionResult."
             )
 
+        if validation_issues is not None and not isinstance(
+            validation_issues,
+            list,
+        ):
+            raise TypeError(
+                "validation_issues must be a list when provided."
+            )
+
         cleaned_question = (
             user_question.strip()
         )
@@ -675,6 +704,7 @@ Requirements:
             intent=intent,
             analysis_result=analysis_result,
             query_result=query_result,
+            validation_issues=validation_issues,
         )
 
         model_output = self._call_model(

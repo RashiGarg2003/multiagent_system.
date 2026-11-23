@@ -446,6 +446,13 @@ class OutputQualityResponse(APISchema):
         ),
     )
 
+    issues: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Safe deterministic validation issues requiring correction."
+        ),
+    )
+
 
 # ---------------------------------------------------------------------
 # Intent and planning details

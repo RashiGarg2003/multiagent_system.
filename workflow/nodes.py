@@ -1704,12 +1704,53 @@ class WorkflowNodes:
                     "QueryExecutionResult."
                 )
 
+            regeneration_count = state.get(
+                "report_regeneration_count",
+                0,
+            )
+
+            if state.get("final_report") is not None:
+                regeneration_count += 1
+
+            if regeneration_count > state.get(
+                "max_report_regenerations",
+                0,
+            ):
+                raise ValueError(
+                    "Report regeneration limit was exceeded."
+                )
+
+            previous_validation = state.get(
+                "deterministic_validation_result"
+            )
+
+            validation_issues = (
+                list(previous_validation.issues)
+                if (
+                    regeneration_count > 0
+                    and isinstance(
+                        previous_validation,
+                        DeterministicValidationResult,
+                    )
+                )
+                else None
+            )
+
+            report_arguments = {
+                "user_question": question,
+                "intent": intent,
+                "analysis_result": analysis_result,
+                "query_result": query_result,
+            }
+
+            if validation_issues:
+                report_arguments[
+                    "validation_issues"
+                ] = validation_issues
+
             final_report = (
                 self.reporting_agent.create_report(
-                    user_question=question,
-                    intent=intent,
-                    analysis_result=analysis_result,
-                    query_result=query_result,
+                    **report_arguments
                 )
             )
 
@@ -1733,6 +1774,9 @@ class WorkflowNodes:
                 "output_evaluation": None,
                 "output_guard_result": None,
                 "sanitized_output_payload": None,
+                "report_regeneration_count": (
+                    regeneration_count
+                ),
                 "output_validation_message": None,
 
                 "workflow_status": "validating_output",

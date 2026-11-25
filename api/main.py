@@ -2285,16 +2285,12 @@ Unexpected backend exceptions return HTTP 500.
         print("=" * 80 + "\n")
 
         error_detail = {
-            "error_type": type(exc).__name__,
-            "message": str(exc),
+            "error_type": "InternalServerError",
+            "message": (
+                "The analytics backend encountered "
+                "an unexpected error."
+            ),
         }
-
-        # Include detailed information for Pydantic validation errors
-        if hasattr(exc, "errors"):
-            try:
-                error_detail["validation_errors"] = exc.errors()
-            except Exception:
-                pass
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

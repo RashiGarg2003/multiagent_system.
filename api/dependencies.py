@@ -398,7 +398,7 @@ def get_settings() -> APISettings:
                 value=os.getenv(
                     "EXPOSE_TECHNICAL_DETAILS"
                 ),
-                default=True,
+                default=False,
             )
         ),
     )

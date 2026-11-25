@@ -1724,17 +1724,36 @@ class WorkflowNodes:
                 "deterministic_validation_result"
             )
 
-            validation_issues = (
-                list(previous_validation.issues)
-                if (
-                    regeneration_count > 0
-                    and isinstance(
-                        previous_validation,
-                        DeterministicValidationResult,
-                    )
+            validation_issues = None
+
+            if (
+                regeneration_count > 0
+                and isinstance(
+                    previous_validation,
+                    DeterministicValidationResult,
                 )
-                else None
-            )
+            ):
+                validation_issues = list(
+                    previous_validation.issues
+                )
+
+                for numeric_claim in (
+                    previous_validation.numeric_claims
+                ):
+                    if numeric_claim.supported:
+                        continue
+
+                    claim_detail = (
+                        f"Unsupported numerical claim: "
+                        f"{numeric_claim.claim}"
+                    )
+                    if numeric_claim.claimed_value is not None:
+                        claim_detail += (
+                            f" (claimed value: "
+                            f"{numeric_claim.claimed_value})"
+                        )
+
+                    validation_issues.append(claim_detail)
 
             report_arguments = {
                 "user_question": question,

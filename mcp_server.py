@@ -68,9 +68,6 @@ def _build_database_schema(
         )
 
     return {
-        "database": str(
-            database_manager.database_path
-        ),
         "tables": tables,
         "views": database_manager.get_views(),
     }
@@ -82,105 +79,83 @@ def _build_safe_state_summary(
     include_technical_details: bool,
 ) -> dict[str, Any]:
     status = state.get("workflow_status")
-    final_report = state.get("final_report")
-    query_result = state.get("query_result")
-    output_quality = state.get(
-        "deterministic_validation_result"
+
+    if status == "clarification_required":
+        return {
+            "status": status,
+            "clarification_required": True,
+            "clarification_question": state.get(
+                "clarification_question"
+            ),
+        }
+
+    controlled_statuses = {
+        "security_blocked",
+        "security_review_required",
+        "output_blocked",
+        "output_review_required",
+        "failed",
+    }
+    if status in controlled_statuses:
+        return {
+            "status": status,
+            "security_decision": (
+                "block"
+                if status in {"security_blocked", "output_blocked"}
+                else "review"
+                if status in {
+                    "security_review_required",
+                    "output_review_required",
+                }
+                else None
+            ),
+        }
+
+    if status != "completed":
+        return {
+            "status": "failed",
+        }
+
+    output_guard_result = state.get("output_guard_result")
+    sanitized_payload = state.get("sanitized_output_payload")
+    decision = _enum_value(
+        getattr(output_guard_result, "decision", None)
     )
-    error_type = state.get("error_type")
-    error_message = state.get("error_message")
 
-    report_payload: dict[str, Any] = {}
+    if (
+        decision not in {"allow", "allow_redacted"}
+        or not isinstance(sanitized_payload, dict)
+    ):
+        return {
+            "status": "output_blocked",
+            "security_decision": "block",
+        }
 
-    if final_report is not None:
-        report_payload = (
-            final_report.model_dump(mode="json")
-        )
+    report_payload = sanitized_payload.get("final_report")
+    query_payload = sanitized_payload.get("query_result")
 
-    query_payload: dict[str, Any] | None = None
-
-    if query_result is not None:
-        query_payload = (
-            query_result.model_dump(mode="json")
-        )
+    if not isinstance(report_payload, dict):
+        report_payload = {}
+    if not isinstance(query_payload, dict):
+        query_payload = None
 
     payload: dict[str, Any] = {
-        "status": status,
-        "question": state.get("user_question"),
-        "question_was_redacted": bool(
-            state.get("question_was_redacted", False)
-        ),
-        "security_decision": state.get(
-            "security_decision"
-        ),
-        "clarification_required": bool(
-            state.get("clarification_required", False)
-        ),
-        "clarification_question": state.get(
-            "clarification_question"
-        ),
-        "business_summary": report_payload.get(
-            "business_summary"
-        ),
-        "key_findings": report_payload.get(
-            "key_findings",
-            [],
-        ),
+        "status": "completed",
+        "business_summary": report_payload.get("business_summary"),
+        "key_findings": report_payload.get("key_findings", []),
         "root_cause_indicators": report_payload.get(
-            "root_cause_indicators",
-            [],
+            "root_cause_indicators", []
         ),
-        "recommendations": report_payload.get(
-            "recommendations",
-            [],
-        ),
+        "recommendations": report_payload.get("recommendations", []),
         "chart": report_payload.get("chart"),
-        "limitations": report_payload.get(
-            "limitations",
-            [],
-        ),
+        "limitations": report_payload.get("limitations", []),
         "query_result": query_payload,
-        "output_quality": (
-            output_quality.model_dump(mode="json")
-            if hasattr(output_quality, "model_dump")
-            else None
-        ),
-        "error": (
-            {
-                "error_type": error_type,
-                "message": error_message,
-                "stage": state.get("current_node"),
-            }
-            if status == "failed"
-            else None
-        ),
     }
 
     if include_technical_details:
-        payload["technical_details"] = {
-            "intent": (
-                state.get("intent").model_dump(mode="json")
-                if isinstance(
-                    state.get("intent"),
-                    IntentResult,
-                )
-                else None
-            ),
-            "plan": (
-                state.get("plan").model_dump(mode="json")
-                if hasattr(state.get("plan"), "model_dump")
-                else None
-            ),
-            "generated_sql": state.get("generated_sql"),
-            "sql_retry_count": state.get(
-                "sql_retry_count",
-                0,
-            ),
-            "execution_trace": state.get(
-                "execution_trace",
-                [],
-            ),
-        }
+        technical_payload = sanitized_payload.get("technical_details")
+        if isinstance(technical_payload, dict):
+            payload["technical_details"] = technical_payload
 
     return payload
 
@@ -312,16 +287,8 @@ def create_mcp_server() -> FastMCP:
     )
     async def execute_read_sql(
         sql: str,
-        role: str = "analyst",
     ) -> dict[str, Any]:
         services = _service_container()
-
-        try:
-            normalized_role = UserRole(role.strip().lower())
-        except ValueError as exc:
-            raise ValueError(
-                "role must be one of: viewer, analyst, admin."
-            ) from exc
 
         sql_tool = SQLExecutionTool(
             database_manager=(
@@ -330,7 +297,7 @@ def create_mcp_server() -> FastMCP:
             sql_validator=SQLValidator(
                 dialect="sqlite"
             ),
-            role=normalized_role,
+            role=UserRole.ANALYST,
             explain_before_execution=True,
         )
 
@@ -342,14 +309,10 @@ def create_mcp_server() -> FastMCP:
         if not outcome.success:
             return {
                 "success": False,
-                "validated_sql": (
-                    outcome.validated_sql
-                ),
                 "validation_errors": (
                     outcome.validation_errors
-                ),
-                "execution_error": (
-                    outcome.execution_error
+                    if outcome.validation_errors
+                    else ["The SQL request could not be validated."]
                 ),
                 "stage": outcome.stage,
                 "retryable": outcome.retryable,
@@ -367,7 +330,6 @@ def create_mcp_server() -> FastMCP:
 
         return {
             "success": True,
-            "validated_sql": outcome.validated_sql,
             "query_result": (
                 outcome.query_result
                 .model_dump(mode="json")

@@ -1,175 +1,95 @@
-"""
-Focused tests for MCP server discovery and safe database tools.
-"""
+"""Focused tests for the lifecycle-managed internal MCP tool session."""
 
-import asyncio
-from types import SimpleNamespace
+import pytest
 
-from mcp_server import (
-    _build_safe_state_summary,
-    create_mcp_server,
+from mcp_layer.client import (
+    EXPECTED_TOOLS,
+    InternalMCPClient,
+)
+from models.schemas import (
+    AnalysisPlan,
+    IntentResult,
+    PlanStep,
 )
 
 
-def test_mcp_server_exposes_expected_tools():
-    server = create_mcp_server()
-    tools = asyncio.run(server.list_tools())
-    names = {tool.name for tool in tools}
-
-    assert {
-        "list_database_objects",
-        "get_table_columns",
-        "execute_read_sql",
-        "run_analytics",
-    }.issubset(names)
-
-
-def test_mcp_read_sql_rejects_non_read_query():
-    server = create_mcp_server()
-    result = asyncio.run(
-        server.call_tool(
-            "execute_read_sql",
-            {"sql": "DROP TABLE Orders"},
-        )
+def build_query_arguments(sql: str) -> dict[str, str]:
+    intent = IntentResult(
+        original_question="Show the top 5 products by revenue.",
+        rewritten_question="Rank five products by revenue.",
+        analysis_type="ranking",
+        metrics=["revenue"],
+        dimensions=["product"],
+        sort_order="descending",
+        limit=5,
     )
-
-    assert isinstance(result, tuple)
-    assert len(result) == 2
-    payload = result[1]
-    assert isinstance(payload, dict)
-
-    assert payload["success"] is False
-    assert payload["stage"] == "structural_validation"
-    assert "validated_sql" not in payload
-    assert "execution_error" not in payload
-
-
-def test_execute_read_sql_schema_does_not_expose_role():
-    server = create_mcp_server()
-    tools = asyncio.run(server.list_tools())
-    sql_tool = next(
-        tool for tool in tools
-        if tool.name == "execute_read_sql"
-    )
-
-    assert set(sql_tool.inputSchema["properties"]) == {"sql"}
-    assert "role" not in sql_tool.inputSchema["properties"]
-
-
-def test_execute_read_sql_accepts_select_and_rejects_destructive_sql():
-    server = create_mcp_server()
-
-    select_payload = asyncio.run(
-        server.call_tool(
-            "execute_read_sql",
-            {"sql": "SELECT OrderID FROM Orders LIMIT 1"},
-        )
-    )[1]
-    assert select_payload["success"] is True
-
-    for sql in (
-        "DELETE FROM Orders",
-        "UPDATE Orders SET ShipName=1",
-        "INSERT INTO Orders(OrderID) VALUES(999999)",
-        "DROP TABLE Orders",
-        "CREATE TABLE bad(x)",
-    ):
-        payload = asyncio.run(
-            server.call_tool(
-                "execute_read_sql",
-                {"sql": sql},
+    plan = AnalysisPlan(
+        objective="Rank products by revenue.",
+        strategy="Aggregate and rank product revenue.",
+        steps=[
+            PlanStep(
+                step_id=1,
+                title="Calculate product revenue",
+                description="Aggregate revenue by product.",
+                step_type="ranking",
+                required_metrics=["revenue"],
+                required_dimensions=["product"],
+                requires_sql=True,
+                expected_output="Five products ordered by revenue.",
             )
-        )[1]
-        assert payload["success"] is False
-
-
-def test_mcp_resources_and_prompt_are_discoverable():
-    server = create_mcp_server()
-
-    resources = asyncio.run(server.list_resources())
-    resource_names = {str(resource.uri) for resource in resources}
-    assert "northwind://schema" in resource_names
-    assert "analytics://models" in resource_names
-
-    prompts = asyncio.run(server.list_prompts())
-    assert "analyze_northwind" in {
-        prompt.name for prompt in prompts
-    }
-
-
-def test_completed_mcp_payload_uses_only_sanitized_payload():
-    sanitized = {
-        "final_report": {
-            "business_summary": "Sanitized summary",
-            "key_findings": ["Sanitized finding"],
-        },
-        "query_result": {
-            "columns": ["ProductName"],
-            "rows": [{"ProductName": "Safe"}],
-            "row_count": 1,
-        },
-    }
-
-    state = {
-        "workflow_status": "completed",
-        "output_guard_result": SimpleNamespace(
-            decision="allow"
-        ),
-        "sanitized_output_payload": sanitized,
-        "final_report": SimpleNamespace(
-            model_dump=lambda mode="json": {
-                "business_summary": "Raw secret report"
-            }
-        ),
-        "query_result": SimpleNamespace(
-            model_dump=lambda mode="json": {
-                "rows": [{"secret": "raw-value"}]
-            }
-        ),
-        "generated_sql": "DELETE FROM Orders",
-        "execution_trace": ["sensitive trace"],
-    }
-
-    payload = _build_safe_state_summary(
-        state,
-        include_technical_details=True,
+        ],
     )
+    return {
+        "sql": sql,
+        "intent_json": intent.model_dump_json(),
+        "plan_json": plan.model_dump_json(),
+    }
 
-    assert payload["business_summary"] == "Sanitized summary"
-    assert payload["query_result"] == sanitized["query_result"]
-    assert "Raw secret report" not in repr(payload)
-    assert "DELETE FROM Orders" not in repr(payload)
-    assert "sensitive trace" not in repr(payload)
 
-
-def test_blocked_and_review_mcp_payloads_expose_no_sensitive_state():
-    forbidden = (
-        "DELETE FROM Orders",
-        "raw-secret",
-        "system prompt",
-        "C:\\database\\northwind.db",
-        "trace-event",
-    )
-
-    for status in (
-        "security_blocked",
-        "security_review_required",
-        "output_blocked",
-        "output_review_required",
-        "failed",
-    ):
-        payload = _build_safe_state_summary(
-            {
-                "workflow_status": status,
-                "generated_sql": forbidden[0],
-                "execution_trace": [forbidden[4]],
-                "final_report": forbidden[1],
-                "error_message": forbidden[2],
-                "database_path": forbidden[3],
-            },
-            include_technical_details=True,
+def test_internal_mcp_session_exposes_only_approved_tools():
+    with InternalMCPClient() as client:
+        assert client.tool_names == frozenset(EXPECTED_TOOLS)
+        schema = client.call_tool(
+            "get_approved_schema",
+            {},
         )
 
-        serialized = repr(payload)
-        for value in forbidden:
-            assert value not in serialized
+    assert "schema" in schema
+    assert "Orders" in schema["schema"]
+    assert client.tool_names == frozenset()
+
+
+def test_mcp_executes_read_only_query_and_rejects_mutation():
+    with InternalMCPClient() as client:
+        result = client.call_tool(
+            "execute_validated_read_query",
+            build_query_arguments(
+                'SELECT p.ProductName AS product, '
+                'SUM(od.UnitPrice * od.Quantity) AS revenue '
+                'FROM Products AS p '
+                'JOIN "Order Details" AS od '
+                'ON p.ProductID = od.ProductID '
+                'GROUP BY p.ProductName '
+                'ORDER BY revenue DESC LIMIT 5'
+            ),
+        )
+        rejected = client.call_tool(
+            "execute_validated_read_query",
+            build_query_arguments("DROP TABLE Orders"),
+        )
+
+    assert result["success"] is True
+    assert result["query_result"]["row_count"] == 5
+    assert rejected["success"] is False
+    assert rejected["stage"] == "structural_validation"
+
+
+def test_mcp_tool_does_not_accept_caller_selected_role():
+    with InternalMCPClient() as client:
+        properties = client.tool_input_schemas[
+            "execute_validated_read_query"
+        ]["properties"]
+
+    with pytest.raises(ValueError):
+        client.call_tool("execute_read_sql", {"sql": "SELECT 1"})
+    assert set(properties) == {"sql", "intent_json", "plan_json"}

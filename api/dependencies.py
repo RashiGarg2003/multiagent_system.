@@ -6,8 +6,7 @@ This module initializes and reuses:
 1. OllamaManager
 2. Compiled LangGraph workflow
 3. DatabaseManager
-4. ChartTool
-5. Backend configuration
+4. Backend configuration
 
 The resources are created lazily and cached. Importing this file does
 not immediately start Ollama or run the workflow.
@@ -17,13 +16,15 @@ injection.
 """
 
 import os
+import threading
 from dataclasses import dataclass
+from dataclasses import field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from database.db_manager import DatabaseManager
-from tools.chart_tool import ChartTool
+from mcp_layer.client import InternalMCPClient
 from utils.ollama_manager import OllamaManager
 from workflow.graph import create_graph
 
@@ -72,7 +73,6 @@ class APISettings:
     database_path: Path
 
     maximum_result_rows: int
-    maximum_chart_rows: int
     maximum_sql_retries: int
     langgraph_recursion_limit: int
 
@@ -100,15 +100,23 @@ class AppServices:
         database_manager:
             Read-only SQLite database manager used for readiness checks.
 
-        chart_tool:
-            Deterministic Plotly chart renderer.
     """
 
     settings: APISettings
     ollama_manager: OllamaManager
     graph: Any
     database_manager: DatabaseManager
-    chart_tool: ChartTool
+    mcp_client: InternalMCPClient | None = None
+    active_clarification_threads: set[str] = field(
+        default_factory=set
+    )
+    resuming_clarification_threads: set[str] = field(
+        default_factory=set
+    )
+    clarification_lock: Any = field(
+        default_factory=threading.Lock,
+        repr=False,
+    )
 
 
 class ServiceInitializationError(RuntimeError):
@@ -343,16 +351,6 @@ def get_settings() -> APISettings:
                 maximum=10000,
             )
         ),
-        maximum_chart_rows=(
-            _parse_integer(
-                variable_name=(
-                    "MAXIMUM_CHART_ROWS"
-                ),
-                default=100,
-                minimum=1,
-                maximum=1000,
-            )
-        ),
         maximum_sql_retries=(
             _parse_integer(
                 variable_name=(
@@ -449,7 +447,9 @@ def create_database_manager(
     )
 
 
-def initialize_services() -> AppServices:
+def initialize_services(
+    mcp_client: InternalMCPClient,
+) -> AppServices:
     """
     Initialize all long-lived FastAPI resources.
 
@@ -460,7 +460,7 @@ def initialize_services() -> AppServices:
     3. Confirm required models.
     4. Confirm database connection and integrity.
     5. Compile the LangGraph workflow.
-    6. Initialize ChartTool.
+    6. Initialize the clarification-session registry.
 
     Raises:
         ServiceInitializationError:
@@ -511,20 +511,14 @@ def initialize_services() -> AppServices:
                 f"{integrity_result}"
             )
 
-        graph = create_graph()
-
-        chart_tool = ChartTool(
-            maximum_chart_rows=(
-                settings.maximum_chart_rows
-            )
-        )
+        graph = create_graph(mcp_client)
 
         return AppServices(
             settings=settings,
             ollama_manager=ollama_manager,
             graph=graph,
             database_manager=database_manager,
-            chart_tool=chart_tool,
+            mcp_client=mcp_client,
         )
 
     except Exception as exc:
@@ -536,7 +530,9 @@ def initialize_services() -> AppServices:
 
 
 @lru_cache(maxsize=1)
-def get_services() -> AppServices:
+def get_services(
+    mcp_client: InternalMCPClient,
+) -> AppServices:
     """
     Return the cached backend service container.
 
@@ -545,7 +541,7 @@ def get_services() -> AppServices:
     cached container.
     """
 
-    return initialize_services()
+    return initialize_services(mcp_client)
 
 
 def clear_dependency_caches() -> None:
@@ -704,7 +700,16 @@ def main() -> None:
     print("=" * 80)
 
     try:
-        services = get_services()
+        mcp_client = InternalMCPClient(
+            database_path=(
+                get_settings().database_path
+            ),
+            maximum_result_rows=(
+                get_settings().maximum_result_rows
+            ),
+        )
+        with mcp_client:
+            services = initialize_services(mcp_client)
 
         print(
             f"Application       : "

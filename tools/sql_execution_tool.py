@@ -31,11 +31,17 @@ import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from sqlglot import exp, parse_one
+
 from database.db_manager import (
     DatabaseManager,
     QueryResult,
 )
-from models.schemas import QueryExecutionResult
+from models.schemas import (
+    AnalysisPlan,
+    IntentResult,
+    QueryExecutionResult,
+)
 from security.models import (
     SchemaPolicyResult,
     UserRole,
@@ -398,6 +404,314 @@ class SQLExecutionTool:
             query=result.query,
         )
 
+    def _intent_alignment_errors(
+        self,
+        sql: str,
+        validation_result: SQLValidationResult,
+        intent: IntentResult,
+        plan: AnalysisPlan,
+    ) -> list[str]:
+        """Check objective SQL shape against the validated intent and plan."""
+        try:
+            expression = parse_one(
+                sql,
+                read=self.sql_validator.dialect,
+            )
+        except Exception:
+            return ["The query could not be matched to the validated intent."]
+
+        select = expression if isinstance(expression, exp.Select) else (
+            expression.find(exp.Select)
+        )
+        if select is None:
+            return ["The validated query has no SELECT projection."]
+
+        def tokens(value: str) -> set[str]:
+            ignored = {
+                "a", "an", "and", "by", "for", "from", "in",
+                "of", "on", "or", "the", "to", "with", "total",
+                "number", "amount", "value",
+            }
+            separated = re.sub(
+                r"(?<=[a-z0-9])(?=[A-Z])",
+                " ",
+                value,
+            )
+            return {
+                token[:-1] if token.endswith("s") and len(token) > 4 else token
+                for token in re.findall(r"[a-z0-9]+", separated.lower())
+                if token not in ignored
+            }
+
+        def matches(concept: str, candidates: set[str]) -> bool:
+            concept_tokens = tokens(concept)
+            return bool(concept_tokens and concept_tokens & candidates)
+
+        projections = list(select.expressions)
+        output_names = {
+            token
+            for projection in projections
+            for token in tokens(
+                f"{projection.alias_or_name} {projection.sql(dialect='sqlite')}"
+            )
+        }
+        reference_names = {
+            token
+            for column in expression.find_all(exp.Column)
+            for token in tokens(column.name)
+        }
+        errors: list[str] = []
+
+        requested_metrics = list(intent.metrics)
+        for step in plan.steps:
+            requested_metrics.extend(step.required_metrics)
+        for metric in dict.fromkeys(requested_metrics):
+            if not matches(metric, output_names):
+                errors.append(
+                    f"The SELECT output does not represent requested metric '{metric}'."
+                )
+
+        requested_dimensions = list(intent.dimensions)
+        for step in plan.steps:
+            requested_dimensions.extend(step.required_dimensions)
+        for dimension in dict.fromkeys(requested_dimensions):
+            if not matches(
+                dimension,
+                output_names | reference_names,
+            ):
+                errors.append(
+                    f"The query does not include requested dimension '{dimension}'."
+                )
+
+        has_aggregate = any(
+            projection.find(exp.AggFunc) is not None
+            for projection in projections
+        )
+        if has_aggregate and requested_dimensions and select.args.get("group") is None:
+            errors.append(
+                "The aggregate query does not group by its requested dimensions."
+            )
+
+        if len(validation_result.referenced_tables) > 1:
+            join_count = sum(
+                1 for _ in expression.find_all(exp.Join)
+            )
+            required_joins = len(
+                validation_result.referenced_tables
+            ) - 1
+            if join_count < required_joins:
+                errors.append(
+                    "The query does not join all referenced tables."
+                )
+
+        if intent.filters:
+            where = expression.find(exp.Where)
+            for filter_condition in intent.filters:
+                if where is None:
+                    errors.append(
+                        f"The query omits requested filter '{filter_condition.field}'."
+                    )
+                    continue
+                matching_predicates = [
+                    predicate
+                    for predicate in where.this.walk()
+                    if isinstance(predicate, exp.Expression)
+                    and predicate.__class__.__name__
+                    in {
+                        "EQ", "NEQ", "GT", "GTE", "LT", "LTE",
+                        "Between", "In", "Like", "ILike",
+                    }
+                    and any(
+                        matches(filter_condition.field, tokens(column.name))
+                        for column in predicate.find_all(exp.Column)
+                    )
+                ]
+                if not matching_predicates:
+                    errors.append(
+                        f"The query does not filter on '{filter_condition.field}'."
+                    )
+                    continue
+
+                operator_names = {
+                    "equals": {"EQ"},
+                    "equal": {"EQ"},
+                    "eq": {"EQ"},
+                    "not_equal": {"NEQ"},
+                    "not_equals": {"NEQ"},
+                    "greater_than": {"GT"},
+                    "gt": {"GT"},
+                    "greater_than_or_equal": {"GTE"},
+                    "greater_than_or_equal_to": {"GTE"},
+                    "gte": {"GTE"},
+                    "less_than": {"LT"},
+                    "lt": {"LT"},
+                    "less_than_or_equal": {"LTE"},
+                    "less_than_or_equal_to": {"LTE"},
+                    "lte": {"LTE"},
+                    "between": {"Between"},
+                    "in": {"In"},
+                    "contains": {"Like", "ILike"},
+                    "starts_with": {"Like", "ILike"},
+                    "ends_with": {"Like", "ILike"},
+                    "like": {"Like", "ILike"},
+                }
+                expected_operators = operator_names.get(
+                    filter_condition.operator.strip().lower()
+                )
+                if expected_operators is None or not any(
+                    predicate.__class__.__name__ in expected_operators
+                    for predicate in matching_predicates
+                ):
+                    errors.append(
+                        f"The query does not use the requested operator for '{filter_condition.field}'."
+                    )
+
+                expected_values = filter_condition.value
+                if isinstance(expected_values, dict):
+                    expected_values = list(expected_values.values())
+                elif not isinstance(expected_values, (list, tuple, set)):
+                    expected_values = [expected_values]
+                expected_text = {
+                    str(value).strip().casefold()
+                    for value in expected_values
+                    if value is not None
+                }
+                actual_text = {
+                    str(literal.this).strip().casefold()
+                    for predicate in matching_predicates
+                    for literal in predicate.find_all(exp.Literal)
+                }
+                if expected_text and not expected_text.issubset(actual_text):
+                    errors.append(
+                        f"The query does not apply the requested value for '{filter_condition.field}'."
+                    )
+
+        time_period = intent.time_period
+        explicit_period_values = [
+            value
+            for value in (
+                time_period.start_date,
+                time_period.end_date,
+            )
+            if value
+        ]
+        has_time_column = any(
+            re.search(
+                r"date|time|year|month|quarter|week",
+                column.name,
+                flags=re.IGNORECASE,
+            )
+            for column in expression.find_all(exp.Column)
+        )
+        granularity_labels = {
+            "day",
+            "daily",
+            "week",
+            "weekly",
+            "month",
+            "monthly",
+            "quarter",
+            "quarterly",
+            "year",
+            "yearly",
+            "annual",
+            "annually",
+        }
+        current_period_is_granularity = (
+            time_period.current_period is not None
+            and time_period.current_period.casefold().strip()
+            in granularity_labels
+        )
+        has_time_filter = any(
+            (
+                time_period.start_date,
+                time_period.end_date,
+                time_period.comparison_period,
+                (
+                    time_period.current_period
+                    if not current_period_is_granularity
+                    else None
+                ),
+            )
+        )
+        if has_time_filter:
+            where = expression.find(exp.Where)
+            if where is None or not has_time_column:
+                errors.append(
+                    "The query does not apply the requested time period to a time-related field."
+                )
+            else:
+                actual_literals = {
+                    str(literal.this).strip().casefold()
+                    for literal in where.find_all(exp.Literal)
+                }
+                if any(
+                    value.casefold() not in actual_literals
+                    for value in explicit_period_values
+                ):
+                    errors.append(
+                        "The query does not apply all explicit requested time boundaries."
+                    )
+
+        if time_period.granularity and (
+            not has_time_column
+            or select.args.get("group") is None
+        ):
+            errors.append(
+                "The query does not group a time-related field by the requested granularity."
+            )
+
+        if intent.sort_order is not None:
+            order = select.args.get("order")
+            ordered_items = (
+                list(order.expressions)
+                if order is not None
+                else []
+            )
+            wants_descending = intent.sort_order == "descending"
+            if not ordered_items or not any(
+                bool(item.args.get("desc")) == wants_descending
+                for item in ordered_items
+            ):
+                errors.append(
+                    "The query ordering does not match the requested sort direction."
+                )
+
+        if intent.analysis_type == "ranking" and intent.metrics:
+            order = select.args.get("order")
+            ordered_tokens = {
+                token
+                for item in (order.expressions if order is not None else [])
+                for token in tokens(item.sql(dialect="sqlite"))
+            }
+            if not any(
+                matches(metric, ordered_tokens)
+                for metric in intent.metrics
+            ):
+                errors.append(
+                    "The ranking is not ordered by a requested metric."
+                )
+
+        if intent.limit is not None:
+            limit = select.args.get("limit")
+            limit_expression = (
+                limit.expression
+                if limit is not None
+                else None
+            )
+            limit_value = (
+                int(limit_expression.this)
+                if isinstance(limit_expression, exp.Literal)
+                and limit_expression.is_int
+                else None
+            )
+            if limit_value is None or limit_value > intent.limit:
+                errors.append(
+                    "The query limit does not satisfy the requested maximum."
+                )
+
+        return errors
+
     def _validation_failure(
     self,
     validation_result: Optional[
@@ -463,6 +777,8 @@ class SQLExecutionTool:
     def validate_and_execute(
         self,
         sql: str,
+        intent: IntentResult | None = None,
+        plan: AnalysisPlan | None = None,
     ) -> SQLExecutionOutcome:
         """
         Validate and execute one read-only SQL query.
@@ -484,6 +800,32 @@ class SQLExecutionTool:
                     "SQL must be provided as a string."
                 ],
                 stage="input_validation",
+                retryable=False,
+            )
+
+        if (intent is None) != (plan is None):
+            return self._validation_failure(
+                validation_result=None,
+                errors=[
+                    "Intent and analytical plan must be supplied together."
+                ],
+                stage="intent_alignment",
+                retryable=False,
+            )
+
+        if intent is not None and not isinstance(intent, IntentResult):
+            return self._validation_failure(
+                validation_result=None,
+                errors=["Intent metadata is invalid."],
+                stage="intent_alignment",
+                retryable=False,
+            )
+        if plan is not None and not isinstance(plan, AnalysisPlan):
+            return self._validation_failure(
+                validation_result=None,
+                errors=["Analytical plan metadata is invalid."],
+                stage="intent_alignment",
+                retryable=False,
             )
 
         cleaned_sql = sql.strip()
@@ -564,6 +906,19 @@ class SQLExecutionTool:
 
             # The SQL may be regenerated when Agent 3a selected a
             # protected column. SQLite execution is never reached.
+            non_correctable_policy_violations = {
+                "table_not_allowed",
+                "role_not_allowed",
+                "column_not_allowed",
+                "restricted_data",
+                "secret_data",
+                "sensitive_data",
+            }
+            security_violation = any(
+                finding.violation_type
+                in non_correctable_policy_violations
+                for finding in schema_policy_result.findings
+            )
             return self._validation_failure(
                 validation_result=validation_result,
                 errors=policy_errors,
@@ -572,8 +927,25 @@ class SQLExecutionTool:
                 schema_policy_result=(
                     schema_policy_result
                 ),
-                retryable=True,
+                retryable=not security_violation,
             )
+
+        if intent is not None and plan is not None:
+            alignment_errors = self._intent_alignment_errors(
+                normalized_sql,
+                validation_result,
+                intent,
+                plan,
+            )
+            if alignment_errors:
+                return self._validation_failure(
+                    validation_result=validation_result,
+                    errors=alignment_errors,
+                    stage="intent_alignment",
+                    validated_sql=normalized_sql,
+                    schema_policy_result=schema_policy_result,
+                    retryable=True,
+                )
 
         if self.explain_before_execution:
             try:

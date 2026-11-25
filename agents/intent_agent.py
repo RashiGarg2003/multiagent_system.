@@ -22,11 +22,14 @@ This agent does not:
     - Apply hardcoded business rules.
 """
 
+import re
+
 from ollama import Client
 from pydantic import ValidationError
 
 from models.schemas import (
     IntentResult,
+    TimePeriod,
 )
 
 
@@ -516,6 +519,178 @@ Do not include Markdown, commentary, SQL, or an analytical answer.
             }
         )
 
+    @staticmethod
+    def _value_appears_in_question(
+        question: str,
+        value: object,
+    ) -> bool:
+        question_tokens = " ".join(
+            re.findall(r"[a-z0-9]+", question.casefold())
+        )
+        value_tokens = " ".join(
+            re.findall(r"[a-z0-9]+", str(value).casefold())
+        )
+        return bool(
+            value_tokens
+            and f" {value_tokens} "
+            in f" {question_tokens} "
+        )
+
+    def _ground_explicit_constraints(
+        self,
+        result: IntentResult,
+        user_question: str,
+    ) -> IntentResult:
+        question = user_question.strip()
+        filters = []
+        for condition in result.filters:
+            values = condition.value
+            if isinstance(values, dict):
+                values = list(values.values())
+            elif not isinstance(values, (list, tuple, set)):
+                values = [values]
+            if (
+                values
+                and all(
+                    self._value_appears_in_question(
+                        question,
+                        value,
+                    )
+                    for value in values
+                )
+                and not (
+                    len(values) == 1
+                    and str(values[0]).strip().casefold() == "all"
+                )
+            ):
+                filters.append(condition)
+
+        updates: dict[str, object] = {
+            "filters": filters,
+        }
+        time_period = result.time_period
+        explicit_years = set(
+            re.findall(
+                r"\b(?:18|19|20|21)\d{2}\b",
+                question,
+            )
+        )
+
+        def grounded_date(value: str | None) -> str | None:
+            if not value:
+                return None
+            years = re.findall(
+                r"\b(?:18|19|20|21)\d{2}\b",
+                value,
+            )
+            if years:
+                return value if all(
+                    year in explicit_years
+                    for year in years
+                ) else None
+            return (
+                value
+                if self._value_appears_in_question(
+                    question,
+                    value,
+                )
+                else None
+            )
+
+        granularity_aliases = {
+            "day": {"day", "daily"},
+            "week": {"week", "weekly"},
+            "month": {"month", "monthly"},
+            "quarter": {"quarter", "quarterly"},
+            "year": {"year", "yearly", "annual", "annually"},
+        }
+        model_granularity = (
+            time_period.granularity.casefold().strip()
+            if time_period.granularity
+            else ""
+        )
+        grounded_granularity = None
+        for granularity, aliases in granularity_aliases.items():
+            if (
+                model_granularity in aliases
+                and re.search(
+                    r"\b(?:"
+                    + "|".join(sorted(aliases))
+                    + r")\b",
+                    question,
+                    flags=re.IGNORECASE,
+                )
+            ):
+                grounded_granularity = granularity
+                break
+        grounded_current_period = (
+            time_period.current_period
+            if time_period.current_period
+            and time_period.current_period.casefold().strip()
+            not in {
+                alias
+                for aliases in granularity_aliases.values()
+                for alias in aliases
+            }
+            and self._value_appears_in_question(
+                question,
+                time_period.current_period,
+            )
+            else None
+        )
+        grounded_comparison_period = (
+            time_period.comparison_period
+            if time_period.comparison_period
+            and self._value_appears_in_question(
+                question,
+                time_period.comparison_period,
+            )
+            else None
+        )
+        updates["time_period"] = TimePeriod(
+            start_date=grounded_date(
+                time_period.start_date
+            ),
+            end_date=grounded_date(
+                time_period.end_date
+            ),
+            current_period=grounded_current_period,
+            comparison_period=grounded_comparison_period,
+            granularity=grounded_granularity,
+        )
+
+        number_words = {
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+            "six": 6,
+            "seven": 7,
+            "eight": 8,
+            "nine": 9,
+            "ten": 10,
+        }
+        limit_match = re.search(
+            r"\b(?:top|first|bottom|last|highest|lowest|leading|trailing)"
+            r"\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+            question,
+            flags=re.IGNORECASE,
+        )
+        if limit_match:
+            limit_value = limit_match.group(1).casefold()
+            parsed_limit = number_words.get(
+                limit_value,
+                int(limit_value) if limit_value.isdigit() else None,
+            )
+            if (
+                parsed_limit is not None
+                and 1 <= parsed_limit <= 10000
+            ):
+                updates["limit"] = parsed_limit
+
+        return result.model_copy(update=updates)
+
     def understand(
         self,
         user_question: str,
@@ -565,8 +740,12 @@ Do not include Markdown, commentary, SQL, or an analytical answer.
             raw_content=raw_content
         )
 
-        return self._enforce_clarification_policy(
+        result = self._enforce_clarification_policy(
             result=result
+        )
+        return self._ground_explicit_constraints(
+            result=result,
+            user_question=cleaned_question,
         )
 
 

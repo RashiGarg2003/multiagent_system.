@@ -1,44 +1,52 @@
-Multi-Agent Data Analytics System
-=================================
+# Multi-Agent Data Analytics System
 
-FastAPI + Streamlit + LangGraph + Ollama + MCP implementation.
+FastAPI + Streamlit + LangGraph + local Ollama models + SQLite.
 
-## MCP server
+## Architecture
 
-The project exposes Model Context Protocol tools, resources, and prompts.
+- LangGraph calls one lifecycle-managed stdio MCP server through a reusable
+  `ClientSession`.
+- The internal MCP surface contains only `get_approved_schema` and
+  `execute_validated_read_query`; database access remains read-only and
+  policy-validated.
+- Agent 5 is followed by one `UnifiedOutputEvaluator`. It combines deterministic
+  checks, semantic quality judgment, security filtering, redaction, and the
+  final sanitized response payload.
+- Reports can be regenerated at most twice. Security violations block without
+  regeneration.
+- Clarification pauses are checkpointed. The API returns a thread ID, screens
+  the answer, and resumes the same LangGraph thread at Agent 1.
+- FastAPI returns additive safe execution-trace metadata. Streamlit displays
+  it in a collapsed expander and renders charts locally with `ChartTool`.
 
-### Stdio transport
+## Run locally
 
-```powershell
-python mcp_server.py
-```
-
-### Streamable HTTP transport
-
-Start FastAPI on port 8000:
+Start FastAPI:
 
 ```powershell
 python -m uvicorn api.main:app --host 127.0.0.1 --port 8000
 ```
 
-The MCP endpoint is mounted at:
+Start Streamlit in another terminal:
 
-```text
-http://127.0.0.1:8000/mcp/
+```powershell
+streamlit run app.py
 ```
 
-### MCP resources
+## Internal MCP server
 
-- `northwind://schema` - read-only database tables, views, and columns
-- `analytics://models` - Ollama availability and required model status
+The stdio server is managed by FastAPI for the application lifetime. To run it
+standalone for development:
 
-### MCP tools
+```powershell
+python mcp_server.py
+```
 
-- `list_database_objects`
-- `get_table_columns`
-- `execute_read_sql`
-- `run_analytics`
+It exposes only the two internal tools described above. No HTTP MCP endpoint
+is mounted by FastAPI.
 
-### MCP prompt
+## Focused tests
 
-- `analyze_northwind`
+```powershell
+python -m pytest tests\test_unified_evaluator.py tests\test_clarification_checkpoint.py tests\test_safe_trace.py tests\test_chart_presentation.py tests\test_api.py tests\test_mcp_server.py tests\test_sql_intent_alignment.py tests\test_schema_policy.py -q
+```

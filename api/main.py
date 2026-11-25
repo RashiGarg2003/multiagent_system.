@@ -32,8 +32,10 @@ Future security additions:
 """
 
 import asyncio
+import math
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Mapping
+from uuid import uuid4
 
 from fastapi import (
     Depends,
@@ -49,6 +51,7 @@ from fastapi.middleware.cors import (
     CORSMiddleware,
 )
 from fastapi.responses import JSONResponse
+from langgraph.types import Command
 
 from api.dependencies import (
     AppServices,
@@ -60,6 +63,7 @@ from api.dependencies import (
     get_services,
     get_settings,
 )
+from mcp_layer.client import InternalMCPClient
 from api.schemas import (
     AnalyticsQueryRequest,
     AnalyticsQueryResponse,
@@ -112,8 +116,6 @@ WORKFLOW_SEMAPHORE = asyncio.Semaphore(1)
 # Application lifecycle
 # ---------------------------------------------------------------------
 
-mcp_http_app = None
-
 @asynccontextmanager
 async def lifespan(
     application: FastAPI,
@@ -133,27 +135,31 @@ async def lifespan(
     The initialized service container is stored in application.state.
     """
 
+    mcp_client = InternalMCPClient(
+        database_path=get_settings().database_path,
+        maximum_result_rows=(
+            get_settings().maximum_result_rows
+        ),
+    )
+    services = None
     try:
+        await asyncio.to_thread(mcp_client.start)
         services = await asyncio.to_thread(
-            get_services
+            get_services,
+            mcp_client,
         )
-
         application.state.services = services
         application.state.startup_error = None
-
     except Exception as exc:
+        mcp_client.close()
         application.state.services = None
-        application.state.startup_error = str(exc)
+        application.state.startup_error = type(exc).__name__
 
-    if mcp_http_app is not None:
-        async with mcp_http_app.router.lifespan_context(
-            mcp_http_app
-        ):
-            yield
-    else:
+    try:
         yield
-
-    clear_dependency_caches()
+    finally:
+        mcp_client.close()
+        clear_dependency_caches()
 
 
 settings = get_settings()
@@ -195,19 +201,6 @@ app.add_middleware(
         "Accept",
     ],
 )
-
-
-# ---------------------------------------------------------------------
-# Model Context Protocol
-# ---------------------------------------------------------------------
-
-# Mount the MCP streamable-HTTP transport alongside the FastAPI API.
-# The MCP server remains independently runnable over stdio via:
-# python mcp_server.py
-from mcp_server import create_mcp_server
-
-mcp_http_app = create_mcp_server().streamable_http_app()
-app.mount("/mcp", mcp_http_app)
 
 
 # ---------------------------------------------------------------------
@@ -560,6 +553,9 @@ def build_output_quality_response(
         )
 
     return OutputQualityResponse(
+        unified_decision=state.get(
+            "unified_output_decision"
+        ),
         deterministic_decision=(
             deterministic_decision
         ),
@@ -689,16 +685,7 @@ def build_output_quality_response(
             .sanitized_payload
             is not None
         ),
-        issues=(
-            list(
-                deterministic_result.issues
-            )
-            if isinstance(
-                deterministic_result,
-                DeterministicValidationResult,
-            )
-            else []
-        ),
+        issues=[],
         message=state.get(
             "output_validation_message"
         ),
@@ -894,49 +881,8 @@ def build_recommendations(
 def build_trace_response(
     state: GraphState,
 ) -> list[TraceEventResponse]:
-    """
-    Convert the sanitized LangGraph trace into API schemas.
-
-    Unexpected or malformed trace events are excluded.
-    """
-
-    trace_events: list[
-        TraceEventResponse
-    ] = []
-
-    for event in state.get(
-        "execution_trace",
-        [],
-    ):
-        if not isinstance(event, dict):
-            continue
-
-        node = event.get("node")
-        event_status = event.get(
-            "status"
-        )
-        message = event.get("message")
-
-        if not all(
-            isinstance(value, str)
-            and bool(value.strip())
-            for value in (
-                node,
-                event_status,
-                message,
-            )
-        ):
-            continue
-
-        trace_events.append(
-            TraceEventResponse(
-                node=node,
-                status=event_status,
-                message=message,
-            )
-        )
-
-    return trace_events
+    """Compatibility wrapper for the safe public execution trace."""
+    return build_execution_trace(state)
 
 
 def build_technical_details(
@@ -1404,62 +1350,13 @@ def build_sanitized_technical_details(
                 )
             )
 
-    # -------------------------------------------------------------
-    # Safe execution-trace conversion
-    # -------------------------------------------------------------
-
-    trace_response: list[
-        TraceEventResponse
-    ] = []
-
     trace_payload = technical_payload.get(
         "execution_trace",
         [],
     )
-
-    if isinstance(
-        trace_payload,
-        list,
-    ):
-        for event in trace_payload:
-            if not isinstance(
-                event,
-                dict,
-            ):
-                continue
-
-            node = event.get(
-                "node"
-            )
-
-            event_status = event.get(
-                "status"
-            )
-
-            message = event.get(
-                "message"
-            )
-
-            if not all(
-                isinstance(value, str)
-                and bool(value.strip())
-                for value in (
-                    node,
-                    event_status,
-                    message,
-                )
-            ):
-                continue
-
-            trace_response.append(
-                TraceEventResponse(
-                    node=node,
-                    status=event_status,
-                    message=(
-                        message[:500]
-                    ),
-                )
-            )
+    trace_response = build_execution_trace(
+        {"execution_trace": trace_payload}
+    )
 
     # -------------------------------------------------------------
     # Final role-filtered technical response
@@ -1522,10 +1419,76 @@ def build_sanitized_technical_details(
         ),
         intent=intent_response,
         plan=plan_response,
-        execution_trace=(
-            trace_response
-        ),
+        execution_trace=trace_response,
     )
+
+
+def build_execution_trace(
+    state: Mapping[str, Any],
+) -> list[TraceEventResponse]:
+    """Convert controlled workflow events to the public safe trace."""
+    events = state.get("execution_trace", [])
+    if not isinstance(events, list):
+        raise TypeError("execution_trace must be a list.")
+
+    approved_tools = {
+        "get_approved_schema",
+        "execute_validated_read_query",
+    }
+    trace_response: list[TraceEventResponse] = []
+    for event in events:
+        if not isinstance(event, dict):
+            raise TypeError("Execution trace entries must be objects.")
+
+        node = event.get("node")
+        status_value = event.get("status")
+        message = event.get("message")
+        stage = event.get("stage", node)
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (node, status_value, message, stage)
+        ):
+            raise ValueError("Execution trace entry is incomplete.")
+
+        tool = event.get("mcp_tool")
+        if tool not in approved_tools:
+            tool = None
+
+        duration = event.get("duration_ms")
+        if (
+            not isinstance(duration, (int, float))
+            or isinstance(duration, bool)
+            or not math.isfinite(duration)
+            or duration < 0
+        ):
+            duration = None
+
+        sql_retries = event.get("sql_retry_count", 0)
+        report_retries = event.get("report_retry_count", 0)
+        if (
+            not isinstance(sql_retries, int)
+            or isinstance(sql_retries, bool)
+            or sql_retries < 0
+            or not isinstance(report_retries, int)
+            or isinstance(report_retries, bool)
+            or report_retries < 0
+        ):
+            raise ValueError("Execution trace retry counts are invalid.")
+
+        trace_response.append(
+            TraceEventResponse(
+                node=node,
+                stage=stage,
+                status=status_value,
+                duration_ms=duration,
+                mcp_tool=tool,
+                sql_retry_count=sql_retries,
+                report_retry_count=report_retries,
+                message=message,
+            )
+        )
+
+    return trace_response
 
 def build_completed_response(
     state: GraphState,
@@ -1642,6 +1605,7 @@ def build_completed_response(
         ),
         clarification_required=False,
         clarification_question=None,
+        execution_trace=build_execution_trace(state),
         business_summary=(
             business_summary.strip()
         ),
@@ -1676,8 +1640,8 @@ def build_completed_response(
                     technical_payload
                 ),
                 include_technical_details=(
-                    request_body
-                    .include_technical_details
+                    request_body.include_technical_details
+                    and services.settings.expose_technical_details
                 ),
             )
         ),
@@ -1729,6 +1693,8 @@ def build_clarification_response(
         clarification_question=(
             clarification_question
         ),
+        thread_id=state.get("thread_id"),
+        execution_trace=build_execution_trace(state),
         business_summary=None,
         key_findings=[],
         root_cause_indicators=[],
@@ -1840,6 +1806,7 @@ def build_controlled_security_response(
         ),
         clarification_required=False,
         clarification_question=None,
+        execution_trace=build_execution_trace(state),
         business_summary=None,
         key_findings=[],
         root_cause_indicators=[],
@@ -1926,6 +1893,7 @@ def build_failed_response(
         ),
         clarification_required=False,
         clarification_question=None,
+        execution_trace=build_execution_trace(state),
         business_summary=None,
         key_findings=[],
         root_cause_indicators=[],
@@ -2029,25 +1997,38 @@ def invoke_graph_sync(
         maximum_allowed_retries,
     )
 
-    initial_state = create_initial_state(
-        user_question=(
-            request_body.question
-        ),
-        max_sql_retries=(
-            effective_retries
-        ),
-    )
-
-    final_state = services.graph.invoke(
-        initial_state,
-        config={
-            "recursion_limit": (
-                services
-                .settings
-                .langgraph_recursion_limit
-            ),
+    thread_id = request_body.thread_id or str(uuid4())
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
         },
-    )
+        "recursion_limit": (
+            services
+            .settings
+            .langgraph_recursion_limit
+        ),
+    }
+
+    if request_body.thread_id is not None:
+        final_state = services.graph.invoke(
+            Command(
+                resume=request_body.clarification_answer
+            ),
+            config=config,
+        )
+    else:
+        initial_state = create_initial_state(
+            user_question=request_body.question,
+            max_sql_retries=effective_retries,
+        )
+        initial_state["thread_id"] = thread_id
+        final_state = services.graph.invoke(
+            initial_state,
+            config=config,
+        )
+
+    if final_state.get("thread_id") is None:
+        final_state["thread_id"] = thread_id
 
     return final_state
 
@@ -2258,6 +2239,24 @@ Unavailable backend services return HTTP 503.
 Unexpected backend exceptions return HTTP 500.
     """
 
+    resume_thread_id = request_body.thread_id
+    if resume_thread_id is not None:
+        with services.clarification_lock:
+            if resume_thread_id not in services.active_clarification_threads:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Clarification session was not found or has expired.",
+                )
+            if resume_thread_id in services.resuming_clarification_threads:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Clarification session is already being resumed.",
+                )
+            services.resuming_clarification_threads.add(
+                resume_thread_id
+            )
+
+    final_state: GraphState | None = None
     try:
         final_state = (
             await execute_analytics_workflow(
@@ -2265,6 +2264,19 @@ Unexpected backend exceptions return HTTP 500.
                 request_body=request_body,
             )
         )
+
+        final_status = final_state.get("workflow_status")
+        final_thread_id = final_state.get("thread_id")
+        with services.clarification_lock:
+            if final_status == "clarification_required":
+                if isinstance(final_thread_id, str):
+                    services.active_clarification_threads.add(
+                        final_thread_id
+                    )
+            elif resume_thread_id is not None:
+                services.active_clarification_threads.discard(
+                    resume_thread_id
+                )
 
         return convert_state_to_response(
             state=final_state,
@@ -2296,6 +2308,12 @@ Unexpected backend exceptions return HTTP 500.
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=error_detail,
         ) from exc
+    finally:
+        if resume_thread_id is not None:
+            with services.clarification_lock:
+                services.resuming_clarification_threads.discard(
+                    resume_thread_id
+                )
 
 
 @app.get(

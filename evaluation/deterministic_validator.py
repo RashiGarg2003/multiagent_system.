@@ -1512,16 +1512,23 @@ class DeterministicOutputValidator:
             in secret_types
         ]
 
-        non_secret_findings = [
+        restricted_types = {
+            "aadhaar_number",
+            "pan_number",
+            "payment_card_number",
+            "bank_account_number",
+            "upi_identifier",
+            "indian_passport_number",
+        }
+
+        restricted_findings = [
             finding
             for finding in findings
-            if finding.entity_type
-            not in secret_types
+            if finding.entity_type in restricted_types
         ]
 
         pii_safe = (
-            len(non_secret_findings)
-            == 0
+            not restricted_findings
         )
 
         secret_safe = (
@@ -1532,8 +1539,7 @@ class DeterministicOutputValidator:
         if not pii_safe:
             issues.append(
                 "The generated output contains "
-                "personal, confidential, or "
-                "restricted information."
+                "restricted personal information."
             )
 
         if not secret_safe:

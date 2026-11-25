@@ -35,6 +35,7 @@ Streamlit does not directly access:
 - SQL execution tools
 """
 
+import json
 import os
 from typing import Any
 
@@ -532,7 +533,7 @@ def initialize_session_state() -> None:
         "api_response": None,
         "api_error": None,
         "last_question": "",
-        "include_technical_details": True,
+        "include_technical_details": False,
     }
 
     for key, value in defaults.items():
@@ -612,6 +613,8 @@ def get_model_status() -> dict[str, Any]:
 def submit_analytics_question(
     question: str,
     include_technical_details: bool,
+    thread_id: str | None = None,
+    clarification_answer: str | None = None,
 ) -> dict[str, Any]:
     """
     Submit a business question to FastAPI.
@@ -643,6 +646,9 @@ def submit_analytics_question(
             include_technical_details
         ),
     }
+    if thread_id is not None and clarification_answer is not None:
+        request_body["thread_id"] = thread_id
+        request_body["clarification_answer"] = clarification_answer
 
     try:
         response = requests.post(
@@ -674,27 +680,25 @@ def submit_analytics_question(
         ) from exc
 
     if response.status_code == 422:
-        validation_payload = response.json()
-
         raise ValueError(
-            "FastAPI rejected the request: "
-            f"{validation_payload}"
+            "The request could not be validated. Check the question "
+            "and any clarification answer."
         )
 
     if response.status_code == 503:
         raise RuntimeError(
-            "The FastAPI backend is running, but "
-            "Ollama, the database, or LangGraph "
-            "is not ready."
+            "The analytics service is not ready. Please try again later."
         )
 
     if response.status_code >= 500:
         raise RuntimeError(
-            "The FastAPI backend encountered an "
-            f"unexpected error: {response.text}"
+            "The analytics service could not complete the request."
         )
 
-    response.raise_for_status()
+    if response.status_code >= 400:
+        raise RuntimeError(
+            "The analytics request could not be completed."
+        )
 
     payload = response.json()
 
@@ -945,9 +949,9 @@ def display_chart(
                             st.warning(warning)
                 return
 
-        except Exception as exc:
+        except Exception:
             st.caption(
-                f"Requested chart could not be rendered: {exc}"
+                "The requested visualization could not be rendered."
             )
 
     if visualization_df.empty:
@@ -1221,6 +1225,28 @@ def display_query_results(
         ),
     )
 
+    csv_column, json_column = st.columns(2)
+    with csv_column:
+        st.download_button(
+            "Download CSV",
+            data=display_df.to_csv(index=False).encode("utf-8"),
+            file_name="analytics-results.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with json_column:
+        st.download_button(
+            "Download JSON",
+            data=json.dumps(
+                query_payload,
+                ensure_ascii=True,
+                indent=2,
+            ),
+            file_name="analytics-results.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
     if not show_all_rows and len(display_df) > 10:
         st.caption(
             f"Showing 10 of {len(display_df):,} rows. "
@@ -1417,7 +1443,6 @@ def display_technical_details(
                 "Intent",
                 "Plan",
                 "Generated SQL",
-                "Execution Trace",
             ]
         )
 
@@ -1436,10 +1461,107 @@ def display_technical_details(
                 technical_details
             )
 
-        with tabs[3]:
-            display_trace_details(
-                technical_details
-            )
+
+def display_execution_trace(
+    api_response: dict[str, Any],
+) -> None:
+    """Show the safe workflow trace in a collapsed expander."""
+    trace = api_response.get("execution_trace", [])
+    if not isinstance(trace, list) or not trace:
+        return
+
+    with st.expander("Execution trace", expanded=False):
+        display_df = pd.DataFrame(trace)
+        columns = [
+            "stage",
+            "status",
+            "message",
+            "duration_ms",
+            "mcp_tool",
+            "sql_retry_count",
+            "report_retry_count",
+        ]
+        visible_columns = [
+            column
+            for column in columns
+            if column in display_df.columns
+        ]
+        st.dataframe(
+            display_df[visible_columns],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+def display_quality_info(
+    api_response: dict[str, Any],
+) -> None:
+    """Display only controlled quality scores and check outcomes."""
+    quality = api_response.get("output_quality")
+    if not isinstance(quality, dict):
+        return
+
+    safe_fields = {
+        key: quality.get(key)
+        for key in (
+            "unified_decision",
+            "deterministic_decision",
+            "llm_evaluation_decision",
+            "output_guard_decision",
+            "deterministic_valid",
+            "numerical_claims_valid",
+            "ranking_valid",
+            "chart_valid",
+            "redaction_count",
+            "relevance_score",
+            "groundedness_score",
+            "accuracy_score",
+            "overall_score",
+        )
+        if quality.get(key) is not None
+    }
+    if not safe_fields:
+        return
+
+    with st.expander("Quality information", expanded=False):
+        st.json(safe_fields)
+
+
+def display_summary_cards(
+    api_response: dict[str, Any],
+) -> None:
+    """Display compact executive summary indicators."""
+    query_result = api_response.get("query_result")
+    findings = api_response.get("key_findings", [])
+    recommendations = api_response.get("recommendations", [])
+    quality = api_response.get("output_quality")
+    row_count = (
+        query_result.get("row_count", 0)
+        if isinstance(query_result, dict)
+        else 0
+    )
+    quality_status = (
+        quality.get(
+            "unified_decision",
+            quality.get("output_guard_decision", "Not available"),
+        )
+        if isinstance(quality, dict)
+        else "Not available"
+    )
+
+    columns = st.columns(4)
+    columns[0].metric("Rows analyzed", f"{row_count:,}")
+    columns[1].metric(
+        "Key findings",
+        len(findings) if isinstance(findings, list) else 0,
+    )
+    columns[2].metric(
+        "Recommendations",
+        len(recommendations)
+        if isinstance(recommendations, list)
+        else 0,
+    )
+    columns[3].metric("Output status", str(quality_status).replace("_", " ").title())
 
 
 # ---------------------------------------------------------------------
@@ -1456,6 +1578,9 @@ def display_completed_response(
     st.success(
         "Analysis completed successfully."
     )
+
+    display_summary_cards(api_response)
+    display_quality_info(api_response)
 
     display_business_summary(
         api_response
@@ -1528,6 +1653,7 @@ def display_clarification_response(
             "",
         ),
     )
+    thread_id = api_response.get("thread_id")
 
     with st.form(
         "clarification_answer_form",
@@ -1551,33 +1677,27 @@ def display_clarification_response(
     if answer_submitted:
         cleaned_answer = clarification_answer.strip()
 
-        if not cleaned_answer:
+        if not cleaned_answer or not isinstance(thread_id, str):
             st.warning(
-                "Please enter the requested information."
+                "The clarification session is unavailable. Submit a new "
+                "question to restart the analysis."
             )
         else:
-            combined_question = (
-                f"{original_question}\n\n"
-                f"Clarification answer: {cleaned_answer}"
-            )
-
-            st.session_state[
-                "last_question"
-            ] = combined_question
-
-            with st.spinner(
-                "Running the analysis with "
-                "the added clarification..."
-            ):
+            with st.status(
+                "Resuming the same analysis session...",
+                expanded=True,
+            ) as progress:
                 try:
                     revised_response = (
                         submit_analytics_question(
-                            question=combined_question,
+                            question=str(original_question),
                             include_technical_details=(
                                 st.session_state[
                                     "include_technical_details"
                                 ]
                             ),
+                            thread_id=thread_id,
+                            clarification_answer=cleaned_answer,
                         )
                     )
 
@@ -1588,13 +1708,21 @@ def display_clarification_response(
                     st.session_state[
                         "api_error"
                     ] = None
+                    progress.update(
+                        label="Analysis session resumed",
+                        state="complete",
+                        expanded=False,
+                    )
 
                     st.rerun()
 
-                except Exception as exc:
+                except Exception:
                     st.session_state[
                         "api_error"
-                    ] = str(exc)
+                    ] = (
+                        "The clarification could not be processed. "
+                        "Please try again."
+                    )
                     st.session_state[
                         "api_response"
                     ] = None
@@ -1616,47 +1744,9 @@ def display_failed_response(
         "complete the request."
     )
 
-    error = api_response.get(
-        "error"
+    st.info(
+        "No results were released. You can try the question again."
     )
-
-    if isinstance(error, dict):
-        error_type = error.get(
-            "error_type"
-        )
-
-        message = error.get(
-            "message"
-        )
-
-        stage = error.get(
-            "stage"
-        )
-
-        retryable = error.get(
-            "retryable",
-            False,
-        )
-
-        if error_type:
-            st.markdown(
-                f"**Error type:** "
-                f"`{error_type}`"
-            )
-
-        if stage:
-            st.markdown(
-                f"**Workflow stage:** "
-                f"`{stage}`"
-            )
-
-        if message:
-            st.write(message)
-
-        if retryable:
-            st.info(
-                "The request may succeed if submitted again."
-            )
 
     display_technical_details(
         api_response
@@ -1715,8 +1805,8 @@ def display_review_required_response(
     if isinstance(output_quality, dict):
         deterministic_decision = str(
             output_quality.get(
-                "deterministic_decision",
-                "",
+                "unified_decision",
+                output_quality.get("deterministic_decision", ""),
             )
         ).strip().lower()
 
@@ -1752,38 +1842,16 @@ def display_review_required_response(
     # Display output-quality information
     if isinstance(output_quality, dict):
         quality_message = output_quality.get("message")
-        issues = output_quality.get("issues")
-
         if (
             quality_message
             and quality_message != security_message
         ):
             st.write(quality_message)
 
-        if (
-            deterministic_decision == "regenerate"
-            and isinstance(issues, list)
-            and issues
-        ):
-            st.markdown("**Checks that failed:**")
-            for issue in issues:
-                st.write(f"- {issue}")
-
         st.caption(
-            "Output validation decision: "
-            f"{output_quality.get('deterministic_decision')} | "
-            "LLM evaluation: "
-            f"{output_quality.get('llm_evaluation_decision')}"
+            "Unified output decision: "
+            f"{output_quality.get('unified_decision', 'Not available')}"
         )
-
-        # Temporary debugging information
-        with st.expander("Output quality details"):
-            if issues:
-                st.markdown("**Checks that failed:**")
-                for issue in issues:
-                    st.write(f"- {issue}")
-
-            st.json(output_quality)
 
         
 def display_api_response(
@@ -1878,12 +1946,12 @@ def display_sidebar() -> bool:
                     "unexpected health status"
                 )
 
-        except Exception as exc:
+        except Exception:
             st.error(
                 "FastAPI is unavailable"
             )
 
-            st.caption(str(exc))
+            st.caption("Check that the local backend is running.")
 
             st.code(
                 "python -m uvicorn "
@@ -1949,12 +2017,12 @@ def display_sidebar() -> bool:
 
                 st.caption(message)
 
-        except Exception as exc:
+        except Exception:
             st.error(
                 "Backend readiness check failed"
             )
 
-            st.caption(str(exc))
+            st.caption("Backend dependency status is unavailable.")
 
             backend_ready = False
 
@@ -2092,51 +2160,18 @@ def main() -> None:
             "submitting a question."
         )
 
-    example_questions = [
-        "Show the top 5 products by revenue.",
-        "Show the number of orders by country.",
-        "Compare revenue across product categories.",
-        "Show the monthly revenue trend.",
-        (
-            "Which customers generated "
-            "the highest revenue?"
-        ),
-    ]
-
-    selected_example = st.selectbox(
-        "Example questions",
-        options=[
-            "Write my own question",
-            *example_questions,
-        ],
-    )
-
-    if (
-        selected_example
-        == "Write my own question"
-    ):
-        default_question = (
-            st.session_state.get(
-                "last_question",
-                "",
-            )
-        )
-
-    else:
-        default_question = selected_example
-
     with st.form(
         "business_question_form",
         clear_on_submit=False,
     ):
         user_question = st.text_area(
             "Business question",
-            value=default_question,
-            height=100,
-            placeholder=(
-                "Example: Show the top 5 "
-                "products by revenue."
+            value=st.session_state.get(
+                "last_question",
+                "",
             ),
+            height=100,
+            placeholder="What would you like to analyze?",
         )
 
         submitted = st.form_submit_button(
@@ -2166,12 +2201,15 @@ def main() -> None:
                 "api_error"
             ] = None
 
-            with st.spinner(
-                "FastAPI is running the five-agent "
-                "workflow. Local models may take "
-                "several minutes..."
-            ):
+            with st.status(
+                "Running analytics workflow...",
+                expanded=True,
+            ) as progress:
                 try:
+                    st.write(
+                        "Input security → intent and plan → validated SQL "
+                        "→ analysis and report → unified quality checks"
+                    )
                     api_response = (
                         submit_analytics_question(
                             question=(
@@ -2188,11 +2226,19 @@ def main() -> None:
                     st.session_state[
                         "api_response"
                     ] = api_response
+                    progress.update(
+                        label="Workflow response received",
+                        state="complete",
+                        expanded=False,
+                    )
 
-                except Exception as exc:
+                except Exception:
                     st.session_state[
                         "api_error"
-                    ] = str(exc)
+                    ] = (
+                        "The analytics service could not complete the "
+                        "request. Please try again."
+                    )
 
                     st.session_state[
                         "api_response"
@@ -2208,7 +2254,7 @@ def main() -> None:
             "the API request."
         )
 
-        st.write(api_error)
+        st.caption(api_error)
 
     api_response = st.session_state.get(
         "api_response"
@@ -2228,11 +2274,11 @@ def main() -> None:
         display_api_response(
             api_response
         )
+        display_execution_trace(api_response)
 
     else:
         st.info(
-            "Choose an example or enter a business "
-            "question, then select **Analyze Data**."
+            "Enter a business question to begin your analysis."
         )
 
 

@@ -71,8 +71,6 @@ WorkflowStatus = Literal[
 
     # Output validation and security
     "validating_output",
-    "evaluating_output",
-    "guarding_output",
     "regenerating_report",
     "output_blocked",
     "output_review_required",
@@ -122,6 +120,8 @@ class GraphState(TypedDict, total=False):
     workflow_status: WorkflowStatus
 
     current_node: str
+
+    thread_id: Optional[str]
 
     # -----------------------------------------------------------------
     # Input security
@@ -235,6 +235,18 @@ class GraphState(TypedDict, total=False):
         OutputGuardResult
     ]
 
+    unified_output_decision: Optional[
+        Literal[
+            "allow",
+            "allow_redacted",
+            "regenerate",
+            "review",
+            "block",
+        ]
+    ]
+
+    report_validation_feedback: list[str]
+
     # Sanitized payload approved by the final OutputGuard.
     # FastAPI should eventually serialize this payload instead of
     # rebuilding an unrestricted response from raw state values.
@@ -270,7 +282,7 @@ class GraphState(TypedDict, total=False):
 def create_initial_state(
     user_question: str,
     max_sql_retries: int = 3,
-    max_report_regenerations: int = 1,
+    max_report_regenerations: int = 2,
 ) -> GraphState:
     """
     Create a clean initial state for one workflow execution.
@@ -382,6 +394,7 @@ def create_initial_state(
         # Workflow lifecycle
         workflow_status="initialized",
         current_node="start",
+        thread_id=None,
 
         # Security state
         input_guard_result=None,
@@ -429,6 +442,8 @@ def create_initial_state(
         deterministic_validation_result=None,
         output_evaluation=None,
         output_guard_result=None,
+        unified_output_decision=None,
+        report_validation_feedback=[],
         sanitized_output_payload=None,
 
         # Bounded report-regeneration control
@@ -460,6 +475,7 @@ def add_trace_event(
     node: str,
     status: str,
     message: str,
+    mcp_tool: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """
     Return a new execution trace containing one additional event.
@@ -503,6 +519,15 @@ def add_trace_event(
             "message cannot be empty."
         )
 
+    allowed_mcp_tools = {
+        "get_approved_schema",
+        "execute_validated_read_query",
+    }
+    if mcp_tool is not None and mcp_tool not in allowed_mcp_tools:
+        raise ValueError(
+            "mcp_tool must name an approved internal MCP tool."
+        )
+
     # Avoid accidentally storing unlimited model or exception output
     # inside the execution trace.
     maximum_message_length = 500
@@ -528,7 +553,18 @@ def add_trace_event(
     existing_trace.append(
         {
             "node": cleaned_node,
+            "stage": cleaned_node,
             "status": cleaned_status,
+            "duration_ms": None,
+            "mcp_tool": mcp_tool,
+            "sql_retry_count": state.get(
+                "sql_retry_count",
+                0,
+            ),
+            "report_retry_count": state.get(
+                "report_regeneration_count",
+                0,
+            ),
             "message": cleaned_message,
         }
     )
@@ -552,7 +588,7 @@ def main() -> None:
                 "by revenue."
             ),
             max_sql_retries=3,
-            max_report_regenerations=1,
+            max_report_regenerations=2,
         )
 
         state["execution_trace"] = (
@@ -700,7 +736,7 @@ def main() -> None:
 
         if (
             state["max_report_regenerations"]
-            != 1
+            != 2
         ):
             raise RuntimeError(
                 "Unexpected report-regeneration limit."

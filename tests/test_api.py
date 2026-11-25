@@ -47,6 +47,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 from fastapi.testclient import TestClient
+from langgraph.types import Command
 
 from api.dependencies import (
     AppServices,
@@ -68,6 +69,12 @@ from models.schemas import (
     SQLGenerationResult,
     TimePeriod,
 )
+from security.models import (
+    DeterministicValidationResult,
+    OutputEvaluation,
+    UserRole,
+)
+from security.output_guard import OutputGuard
 from workflow.state import (
     GraphState,
     create_initial_state,
@@ -92,6 +99,7 @@ class FakeGraph:
         self.next_state = next_state
         self.last_input_state: GraphState | None = None
         self.last_config: dict[str, Any] | None = None
+        self.calls: list[tuple[Any, dict[str, Any] | None]] = []
 
     def invoke(
         self,
@@ -104,6 +112,9 @@ class FakeGraph:
 
         self.last_input_state = initial_state
         self.last_config = config
+        self.calls.append(
+            (initial_state, config)
+        )
 
         return self.next_state
 
@@ -582,6 +593,77 @@ def build_completed_state() -> GraphState:
         }
     )
 
+    deterministic_result = DeterministicValidationResult(
+        valid=True,
+        schema_valid=True,
+        sql_safe=True,
+        numerical_claims_valid=True,
+        ranking_valid=True,
+        chart_valid=True,
+        pii_safe=True,
+        secret_safe=True,
+        prompt_leakage_safe=True,
+        causal_language_safe=True,
+        numeric_claims=[],
+        verified_claims=[],
+        unsupported_claims=[],
+        privacy_findings=[],
+        issues=[],
+        decision="approve",
+    )
+    output_evaluation = OutputEvaluation(
+        answers_user_question=True,
+        grounded_in_query_result=True,
+        numerical_claims_supported=True,
+        findings_supported=True,
+        recommendations_supported=True,
+        root_cause_language_cautious=True,
+        chart_matches_result=True,
+        contains_sensitive_data=False,
+        contains_prompt_leakage=False,
+        contains_secret_data=False,
+        relevance_score=1.0,
+        groundedness_score=1.0,
+        accuracy_score=1.0,
+        safety_score=1.0,
+        overall_score=1.0,
+        issues=[],
+        decision="approve",
+        explanation="Test response is supported.",
+    )
+    output_guard_result = OutputGuard().guard(
+        final_report=state["final_report"],
+        query_result=state["query_result"],
+        deterministic_result=deterministic_result,
+        output_evaluation=output_evaluation,
+        role=UserRole.ANALYST,
+        allowed_output_columns=set(
+            state["query_result"].columns
+        ),
+        technical_details={
+            "generated_sql": state["generated_sql"],
+            "referenced_tables": list(
+                state["sql_result"].referenced_tables
+            ),
+            "sql_retry_count": 0,
+            "max_sql_retries": 3,
+            "intent": state["intent"].model_dump(mode="json"),
+            "plan": state["plan"].model_dump(mode="json"),
+            "execution_trace": state["execution_trace"],
+        },
+    )
+    state.update(
+        {
+            "deterministic_validation_result": deterministic_result,
+            "output_evaluation": output_evaluation,
+            "output_guard_result": output_guard_result,
+            "sanitized_output_payload": (
+                output_guard_result.sanitized_payload
+            ),
+            "unified_output_decision": "allow",
+        }
+    )
+
     return state
 
 
@@ -744,7 +826,6 @@ def build_fake_services(
         database_manager=(
             FakeDatabaseManager()
         ),  # type: ignore[arg-type]
-        chart_tool=None,  # type: ignore[arg-type]
     )
 
 
@@ -939,6 +1020,11 @@ class FastAPIBackendTests(
             payload["status"],
             "completed",
         )
+        self.assertTrue(payload["execution_trace"])
+        self.assertEqual(
+            payload["execution_trace"][0]["stage"],
+            "start",
+        )
 
         self.assertFalse(
             payload["clarification_required"]
@@ -1130,6 +1216,10 @@ class FastAPIBackendTests(
                 "clarification_question"
             ]
         )
+        self.assertIsInstance(
+            payload["thread_id"],
+            str,
+        )
 
         self.assertIsNone(
             payload["business_summary"]
@@ -1141,6 +1231,45 @@ class FastAPIBackendTests(
 
         self.assertIsNone(
             payload["error"]
+        )
+
+    def test_clarification_answer_resumes_same_thread(
+        self,
+    ) -> None:
+        services = build_fake_services(
+            build_clarification_state()
+        )
+        app.dependency_overrides[
+            get_application_services
+        ] = lambda: services
+
+        first_response = self.client.post(
+            "/api/v1/analytics/query",
+            json={"question": "Analyze the results."},
+        )
+        self.assertEqual(first_response.status_code, 200)
+        thread_id = first_response.json()["thread_id"]
+
+        second_response = self.client.post(
+            "/api/v1/analytics/query",
+            json={
+                "question": "Analyze the results.",
+                "thread_id": thread_id,
+                "clarification_answer": "Revenue by month.",
+            },
+        )
+        self.assertEqual(second_response.status_code, 200)
+
+        graph = services.graph
+        self.assertEqual(len(graph.calls), 2)
+        self.assertEqual(
+            graph.calls[0][1]["configurable"]["thread_id"],
+            graph.calls[1][1]["configurable"]["thread_id"],
+        )
+        self.assertIsInstance(graph.calls[1][0], Command)
+        self.assertEqual(
+            graph.calls[1][0].resume,
+            "Revenue by month.",
         )
 
     def test_controlled_failed_response(
@@ -1338,10 +1467,12 @@ class FastAPIBackendTests(
         )
 
         self.assertEqual(
-            fake_graph.last_config,
-            {
-                "recursion_limit": 40,
-            },
+            fake_graph.last_config["recursion_limit"],
+            40,
+        )
+        self.assertIsInstance(
+            fake_graph.last_config["configurable"]["thread_id"],
+            str,
         )
 
     def test_unexpected_graph_failure_returns_500(
@@ -1364,7 +1495,6 @@ class FastAPIBackendTests(
                 self.services
                 .database_manager
             ),
-            chart_tool=None,  # type: ignore[arg-type]
         )
 
         app.dependency_overrides[

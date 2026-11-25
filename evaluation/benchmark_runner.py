@@ -1252,7 +1252,7 @@ def run_example(
                 example.question
             ),
             max_sql_retries=3,
-            max_report_regenerations=1,
+                max_report_regenerations=2,
             recursion_limit=50,
         )
 

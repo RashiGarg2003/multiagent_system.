@@ -238,7 +238,7 @@ Return only corrected SQL.
             r"Previous SQL:\s*(.+?)\n\n"
             r"Validation or database error:",
             prompt,
-            flags=re.DOTALL,
+            flags=re.IGNORECASE | re.DOTALL,
         )
         previous_error_match = re.search(
             r"(?:VALIDATION OR DATABASE ERROR|"
@@ -290,13 +290,18 @@ Return only corrected SQL.
         SQLCoder fails or cannot return a usable SQL statement.
         """
 
-        if (
-            "VALIDATION OR DATABASE ERROR:" in prompt
-            or "Previous SQL:" in prompt
-        ):
-            return self._call_fallback(
-                self._compact_prompt(prompt)
+        has_retry_context = bool(
+            re.search(
+                r"(?:PREVIOUS SQL|VALIDATION OR DATABASE ERROR):",
+                prompt,
+                flags=re.IGNORECASE,
             )
+        )
+        model_prompt = (
+            self._compact_prompt(prompt)
+            if has_retry_context
+            else prompt
+        )
 
         complete_prompt = f"""
 ### SYSTEM INSTRUCTIONS
@@ -305,7 +310,7 @@ Return only corrected SQL.
 
 ### USER REQUEST
 
-{prompt}
+{model_prompt}
 
 ### SQL QUERY
 
@@ -334,14 +339,12 @@ Return only corrected SQL.
         except Exception as exc:
             error_text = str(exc)
             if "exceeds the available context size" in error_text.lower():
-                compact_prompt = self._compact_prompt(prompt)
-                return self._call_fallback(compact_prompt)
+                return self._call_fallback(model_prompt)
 
             if "token" in error_text.lower():
-                compact_prompt = self._compact_prompt(prompt)
-                return self._call_fallback(compact_prompt)
+                return self._call_fallback(model_prompt)
 
-            return self._call_fallback(prompt)
+            return self._call_fallback(model_prompt)
 
         content = response.response
         cleaned_content = (
@@ -357,9 +360,7 @@ Return only corrected SQL.
         ):
             return cleaned_content
 
-        return self._call_fallback(
-            self._compact_prompt(prompt)
-        )
+        return self._call_fallback(model_prompt)
 
     def _call_fallback(
         self,
@@ -929,8 +930,13 @@ Return exactly one SQL statement and nothing else.
             ):
                 if not alternate:
                     continue
+                table_pattern = (
+                    rf"(?<![\"'\[])\b"
+                    rf"{re.escape(alternate)}\b"
+                    rf"(?![\"'\]])"
+                )
                 canonical_sql = re.sub(
-                    rf"\b{re.escape(alternate)}\b",
+                    table_pattern,
                     replacement,
                     canonical_sql,
                     flags=re.IGNORECASE,
@@ -1155,11 +1161,19 @@ Return exactly one SQL statement and nothing else.
                 "clarification is required."
             )
 
+        is_retry = (
+            previous_sql is not None
+            or previous_error is not None
+        )
         deterministic_helpers = (
-            self._build_schema_orders_by_country_sql,
-            self._build_schema_category_revenue_sql,
-            self._build_schema_monthly_revenue_sql,
-            self._build_schema_revenue_ranking_sql,
+            ()
+            if is_retry
+            else (
+                self._build_schema_orders_by_country_sql,
+                self._build_schema_category_revenue_sql,
+                self._build_schema_monthly_revenue_sql,
+                self._build_schema_revenue_ranking_sql,
+            )
         )
 
         for helper in deterministic_helpers:
@@ -1216,7 +1230,9 @@ Return exactly one SQL statement and nothing else.
                     )
 
         deterministic_sql = (
-            self._build_schema_revenue_ranking_sql(
+            None
+            if is_retry
+            else self._build_schema_revenue_ranking_sql(
                 intent=intent,
                 database_schema=cleaned_schema,
                 limit=intent.limit,
@@ -1349,7 +1365,9 @@ Return exactly one SQL statement and nothing else.
             )
 
         fallback_sql = (
-            self._build_schema_revenue_ranking_sql(
+            None
+            if is_retry
+            else self._build_schema_revenue_ranking_sql(
                 intent=intent,
                 database_schema=cleaned_schema,
                 limit=intent.limit,

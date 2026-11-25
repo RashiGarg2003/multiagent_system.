@@ -49,22 +49,10 @@ Complete workflow:
     Agent 5: Reporting
       |
       v
-    Deterministic Output Validation
+    Unified Output Evaluator
       |
-      +---- blocked --------------------> END
-      |
-      +---- review required ------------> END
-      |
-      v
-    LLM Output Evaluation
-      |
-      +---- blocked --------------------> END
-      |
-      +---- review required ------------> END
-      |
-      v
-    Final Output Guard
-      |
+      +---- regenerate (max 2) ---------> Agent 5
+      +---- blocked/review -------------> END
       +---- blocked --------------------> END
       |
       +---- review required ------------> END
@@ -82,13 +70,16 @@ decision retries report generation when capacity remains; otherwise it
 produces output_review_required and safely ends the workflow.
 """
 
-from typing import Any
+from time import perf_counter
+from typing import Any, Callable
+from uuid import uuid4
 
 from langgraph.graph import (
     END,
     START,
     StateGraph,
 )
+from langgraph.checkpoint.memory import MemorySaver
 
 from workflow.nodes import (
     WorkflowNodes,
@@ -97,23 +88,65 @@ from workflow.nodes import (
 
 from workflow.routing import (
     route_after_analysis,
-    route_after_deterministic_validation,
+    route_after_clarification,
     route_after_input_guard,
     route_after_intent,
-    route_after_llm_output_evaluation,
-    route_after_output_guard,
     route_after_planning,
     route_after_prompt_guard,
     route_after_reporting,
     route_after_schema,
     route_after_sql_execution,
     route_after_sql_generation,
+    route_after_unified_output_evaluator,
 )
 
 from workflow.state import (
     GraphState,
     create_initial_state,
 )
+from mcp_layer.client import InternalMCPClient
+
+
+def _with_safe_trace_timing(
+    node_name: str,
+    node_callable: Callable[[GraphState], dict[str, Any]],
+) -> Callable[[GraphState], dict[str, Any]]:
+    """Measure a node and enrich only its final safe trace event."""
+
+    def invoke(state: GraphState) -> dict[str, Any]:
+        started = perf_counter()
+        update = node_callable(state)
+        if not isinstance(update, dict):
+            raise TypeError(
+                f"Workflow node '{node_name}' returned an invalid update."
+            )
+
+        trace = list(
+            update.get(
+                "execution_trace",
+                state.get("execution_trace", []),
+            )
+        )
+        if trace and trace[-1].get("node") == node_name:
+            event = dict(trace[-1])
+            event["stage"] = node_name
+            event["duration_ms"] = round(
+                (perf_counter() - started) * 1000,
+                2,
+            )
+            event["sql_retry_count"] = update.get(
+                "sql_retry_count",
+                state.get("sql_retry_count", 0),
+            )
+            event["report_retry_count"] = update.get(
+                "report_regeneration_count",
+                state.get("report_regeneration_count", 0),
+            )
+            trace[-1] = event
+            update["execution_trace"] = trace
+        return update
+
+    return invoke
 
 
 # ---------------------------------------------------------------------
@@ -122,6 +155,7 @@ from workflow.state import (
 
 def build_graph(
     workflow_nodes: WorkflowNodes,
+    checkpointer: Any = None,
 ) -> Any:
     """
     Build and compile the complete LangGraph workflow.
@@ -135,9 +169,7 @@ def build_graph(
             - Agents 1 through 5
             - Database schema preparation
             - SQL validation and execution
-            - Deterministic output validation
-            - LLM output evaluation
-            - Final Output Guard
+            - Unified post-Agent-5 output evaluation
             - Clarification and controlled failure nodes
 
     Returns:
@@ -157,16 +189,28 @@ def build_graph(
         GraphState
     )
 
+    def add_timed_node(
+        node_name: str,
+        node_callable: Callable[[GraphState], dict[str, Any]],
+    ) -> None:
+        graph_builder.add_node(
+            node_name,
+            _with_safe_trace_timing(
+                node_name,
+                node_callable,
+            ),
+        )
+
     # -----------------------------------------------------------------
     # Register input-security nodes
     # -----------------------------------------------------------------
 
-    graph_builder.add_node(
+    add_timed_node(
         "input_guard",
         workflow_nodes.input_guard_node,
     )
 
-    graph_builder.add_node(
+    add_timed_node(
         "prompt_injection_guard",
         (
             workflow_nodes
@@ -174,12 +218,12 @@ def build_graph(
         ),
     )
 
-    graph_builder.add_node(
+    add_timed_node(
         "security_block",
         workflow_nodes.security_block_node,
     )
 
-    graph_builder.add_node(
+    add_timed_node(
         "security_review",
         workflow_nodes.security_review_node,
     )
@@ -188,32 +232,32 @@ def build_graph(
     # Register analytical workflow nodes
     # -----------------------------------------------------------------
 
-    graph_builder.add_node(
+    add_timed_node(
         "intent_agent",
         workflow_nodes.intent_node,
     )
 
-    graph_builder.add_node(
+    add_timed_node(
         "clarification",
         workflow_nodes.clarification_node,
     )
 
-    graph_builder.add_node(
+    add_timed_node(
         "planning_agent",
         workflow_nodes.planning_node,
     )
 
-    graph_builder.add_node(
+    add_timed_node(
         "schema_manager",
         workflow_nodes.schema_node,
     )
 
-    graph_builder.add_node(
+    add_timed_node(
         "sql_generation_agent",
         workflow_nodes.sql_generation_node,
     )
 
-    graph_builder.add_node(
+    add_timed_node(
         "sql_validation_execution",
         (
             workflow_nodes
@@ -221,12 +265,12 @@ def build_graph(
         ),
     )
 
-    graph_builder.add_node(
+    add_timed_node(
         "analysis_agent",
         workflow_nodes.analysis_node,
     )
 
-    graph_builder.add_node(
+    add_timed_node(
         "reporting_agent",
         workflow_nodes.reporting_node,
     )
@@ -235,32 +279,16 @@ def build_graph(
     # Register output-validation and protection nodes
     # -----------------------------------------------------------------
 
-    graph_builder.add_node(
-        "deterministic_output_validation",
-        (
-            workflow_nodes
-            .deterministic_validation_node
-        ),
-    )
-
-    graph_builder.add_node(
-        "llm_output_evaluation",
-        (
-            workflow_nodes
-            .llm_output_evaluation_node
-        ),
-    )
-
-    graph_builder.add_node(
-        "output_guard",
-        workflow_nodes.output_guard_node,
+    add_timed_node(
+        "unified_output_evaluator",
+        workflow_nodes.unified_output_evaluator_node,
     )
 
     # -----------------------------------------------------------------
     # Register technical failure node
     # -----------------------------------------------------------------
 
-    graph_builder.add_node(
+    add_timed_node(
         "failure",
         workflow_nodes.failure_node,
     )
@@ -346,9 +374,16 @@ def build_graph(
         },
     )
 
-    graph_builder.add_edge(
+    graph_builder.add_conditional_edges(
         "clarification",
-        END,
+        route_after_clarification,
+        {
+            "intent_agent": "intent_agent",
+            "security_block": "security_block",
+            "security_review": "security_review",
+            "failure": "failure",
+            "clarification_required": END,
+        },
     )
 
     # -----------------------------------------------------------------
@@ -410,6 +445,7 @@ def build_graph(
 
             # Validated query result continues to Agent 4.
             "analysis": "analysis_agent",
+            "security_block": "security_block",
 
             # Retry limit reached or non-retryable failure.
             "failure": "failure",
@@ -439,84 +475,21 @@ def build_graph(
         "reporting_agent",
         route_after_reporting,
         {
-            "deterministic_validation": (
-                "deterministic_output_validation"
+            "unified_output_evaluator": (
+                "unified_output_evaluator"
             ),
             "failure": "failure",
         },
     )
 
-    # -----------------------------------------------------------------
-    # Deterministic output-validation routing
-    # -----------------------------------------------------------------
-
     graph_builder.add_conditional_edges(
-        "deterministic_output_validation",
-        route_after_deterministic_validation,
+        "unified_output_evaluator",
+        route_after_unified_output_evaluator,
         {
-            # All objective validation checks passed.
-            "llm_evaluation": (
-                "llm_output_evaluation"
-            ),
-
-            # Unsafe SQL, restricted data, secrets, prompt
-            # leakage, or another blocking condition.
-            "output_block": END,
-
-            # Retry report generation within the configured bound.
-            "regenerate_report": (
-                "reporting_agent"
-            ),
-
-            # The report needs correction or human review.
-            "output_review": END,
-
-            # Technical validator failure.
-            "failure": "failure",
-        },
-    )
-
-    # -----------------------------------------------------------------
-    # LLM output-evaluation routing
-    # -----------------------------------------------------------------
-
-    graph_builder.add_conditional_edges(
-        "llm_output_evaluation",
-        route_after_llm_output_evaluation,
-        {
-            # Report passed semantic quality evaluation.
-            "output_guard": "output_guard",
-
-            # Semantic evaluator or authoritative deterministic
-            # checks found a blocking condition.
-            "output_block": END,
-
-            # Report needs correction or human review.
-            "output_review": END,
-
-            # Technical evaluator failure.
-            "failure": "failure",
-        },
-    )
-
-    # -----------------------------------------------------------------
-    # Final output-guard routing
-    # -----------------------------------------------------------------
-
-    graph_builder.add_conditional_edges(
-        "output_guard",
-        route_after_output_guard,
-        {
-            # Output is safe or safely redacted.
             "completed": END,
-
-            # Restricted, secret, unauthorized, or leaked output.
             "output_block": END,
-
-            # Final response requires controlled review.
             "output_review": END,
-
-            # Technical output-guard failure.
+            "regenerate_report": "reporting_agent",
             "failure": "failure",
         },
     )
@@ -530,14 +503,19 @@ def build_graph(
         END,
     )
 
-    return graph_builder.compile()
+    return graph_builder.compile(
+        checkpointer=checkpointer
+    )
 
 
 # ---------------------------------------------------------------------
 # Graph factory
 # ---------------------------------------------------------------------
 
-def create_graph() -> Any:
+def create_graph(
+    mcp_client: InternalMCPClient,
+    checkpointer: Any = None,
+) -> Any:
     """
     Create the compiled workflow using configured project components.
 
@@ -545,11 +523,16 @@ def create_graph() -> Any:
     """
 
     workflow_nodes = (
-        build_workflow_nodes()
+        build_workflow_nodes(mcp_client)
     )
 
     return build_graph(
-        workflow_nodes=workflow_nodes
+        workflow_nodes=workflow_nodes,
+        checkpointer=(
+            checkpointer
+            if checkpointer is not None
+            else MemorySaver()
+        ),
     )
 
 
@@ -560,7 +543,7 @@ def create_graph() -> Any:
 def run_workflow(
     user_question: str,
     max_sql_retries: int = 3,
-    max_report_regenerations: int = 1,
+    max_report_regenerations: int = 2,
     recursion_limit: int = 50,
 ) -> GraphState:
     """
@@ -575,8 +558,6 @@ def run_workflow(
 
         max_report_regenerations:
             Maximum number of Agent 5 report-regeneration attempts.
-            The state field is initialized now, but regeneration
-            routing is not connected yet.
 
         recursion_limit:
             Maximum number of LangGraph execution steps.
@@ -598,6 +579,7 @@ def run_workflow(
             "recursion_limit must be greater than zero."
         )
 
+    thread_id = str(uuid4())
     initial_state = create_initial_state(
         user_question=user_question,
         max_sql_retries=(
@@ -607,17 +589,21 @@ def run_workflow(
             max_report_regenerations
         ),
     )
+    initial_state["thread_id"] = thread_id
 
-    graph = create_graph()
-
-    final_state = graph.invoke(
-        initial_state,
-        config={
-            "recursion_limit": (
-                recursion_limit
-            ),
-        },
-    )
+    with InternalMCPClient() as mcp_client:
+        graph = create_graph(mcp_client)
+        final_state = graph.invoke(
+            initial_state,
+            config={
+                "configurable": {
+                    "thread_id": thread_id,
+                },
+                "recursion_limit": (
+                    recursion_limit
+                ),
+            },
+        )
 
     return final_state
 

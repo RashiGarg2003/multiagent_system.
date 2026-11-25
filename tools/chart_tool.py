@@ -590,6 +590,100 @@ class ChartTool:
             chart,
         )
 
+    def _apply_chart_presentation(
+        self,
+        figure: go.Figure,
+        dataframe: pd.DataFrame,
+        chart: ChartSpecification,
+    ) -> None:
+        """Apply consistent labels, number formats, hover, and sizing."""
+        label_map = {
+            column: str(column).replace("_", " ").strip().title()
+            for column in dataframe.columns
+        }
+        category_column = chart.x_column
+        long_categories = (
+            category_column in dataframe.columns
+            and dataframe[category_column]
+            .fillna("")
+            .astype(str)
+            .map(len)
+            .max()
+            > 24
+        )
+
+        figure.update_layout(
+            template="plotly_white",
+            title=chart.title,
+            margin={"l": 70, "r": 30, "t": 70, "b": 70},
+            hovermode="closest",
+            legend_title_text=(
+                label_map.get(chart.category_column)
+                if chart.category_column
+                else None
+            ),
+        )
+
+        if chart.chart_type == "pie":
+            figure.update_traces(
+                textinfo="label+percent",
+                hovertemplate=(
+                    "%{label}<br>Value: %{value:,.2f}"
+                    "<br>Share: %{percent}<extra></extra>"
+                ),
+            )
+            return
+
+        if chart.chart_type == "horizontal_bar":
+            value_column = chart.y_columns[0]
+            figure.update_layout(
+                height=min(
+                    900,
+                    max(360, 140 + 34 * len(dataframe)),
+                )
+            )
+            figure.update_xaxes(
+                title_text=label_map.get(value_column),
+                tickformat=",.2f",
+                automargin=True,
+            )
+            figure.update_yaxes(
+                title_text=label_map.get(chart.x_column),
+                automargin=True,
+                categoryorder="total ascending",
+            )
+            figure.update_traces(
+                hovertemplate=(
+                    "%{y}<br>%{x:,.2f}<extra></extra>"
+                )
+            )
+            return
+
+        figure.update_layout(
+            height=min(
+                700,
+                max(360, 300 + 24 * len(dataframe)),
+            )
+        )
+        figure.update_xaxes(
+            title_text=label_map.get(chart.x_column),
+            tickangle=-35 if long_categories else 0,
+            automargin=True,
+        )
+        figure.update_yaxes(
+            title_text=", ".join(
+                label_map.get(column, column)
+                for column in chart.y_columns
+            ),
+            tickformat=",.2f",
+            automargin=True,
+        )
+        figure.update_traces(
+            hovertemplate=(
+                "%{x}<br>%{y:,.2f}<extra></extra>"
+            )
+        )
+
     def render(
         self,
         chart_specification: ChartSpecification,
@@ -674,10 +768,36 @@ class ChartTool:
                 warnings=row_warnings,
             )
 
+        chart_for_render = chart_specification.model_copy()
+        long_category_warning: list[str] = []
+        if (
+            chart_for_render.chart_type == "bar"
+            and chart_for_render.x_column is not None
+            and chart_for_render.x_column in display_dataframe.columns
+        ):
+            longest_category = (
+                display_dataframe[chart_for_render.x_column]
+                .fillna("")
+                .astype(str)
+                .map(len)
+                .max()
+            )
+            if (
+                longest_category > 24
+                or len(display_dataframe) > 12
+            ):
+                chart_for_render = chart_for_render.model_copy(
+                    update={"chart_type": "horizontal_bar"}
+                )
+                long_category_warning.append(
+                    "A horizontal bar chart was selected to keep "
+                    "category labels readable."
+                )
+
         compatibility_warnings = (
             self._validate_chart_structure(
                 chart_specification=(
-                    chart_specification
+                    chart_for_render
                 ),
                 dataframe=display_dataframe,
             )
@@ -685,6 +805,7 @@ class ChartTool:
 
         all_warnings = [
             *row_warnings,
+            *long_category_warning,
             *compatibility_warnings,
         ]
 
@@ -707,13 +828,18 @@ class ChartTool:
         try:
             figure = self._render_graphical_chart(
                 dataframe=display_dataframe,
-                chart=chart_specification,
+                chart=chart_for_render,
+            )
+            self._apply_chart_presentation(
+                figure=figure,
+                dataframe=display_dataframe,
+                chart=chart_for_render,
             )
 
-        except Exception as exc:
+        except Exception:
             all_warnings.append(
                 "The requested chart could not be rendered. "
-                f"A table was used instead. Error: {exc}"
+                "A table was used instead."
             )
 
             figure = self._render_table(
@@ -734,7 +860,7 @@ class ChartTool:
         return ChartRenderResult(
             figure=figure,
             rendered_chart_type=(
-                chart_specification.chart_type
+                chart_for_render.chart_type
             ),
             used_fallback=False,
             warnings=all_warnings,

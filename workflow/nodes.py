@@ -1,20 +1,8 @@
 """
 LangGraph nodes for the Multi-Agent Data Analytics System.
 
-Currently integrated:
-
-1. Agent 1: Intent Understanding
-2. Clarification handling
-3. Agent 2: Planning
-4. Database schema preparation
-5. Agent 3a: SQL Generation
-6. Agent 3b: SQL Validation and Execution
-7. Controlled workflow failure handling
-
-Future additions:
-
-8. Agent 4: Analysis
-9. Agent 5: Reporting
+The workflow includes checkpointed clarification, read-only MCP database
+access, Agents 1 through 5, and one unified post-report evaluator.
 
 Each node:
 
@@ -31,36 +19,23 @@ from agents.intent_agent import IntentAgent
 from agents.planning_agent import PlanningAgent
 from agents.reporting_agent import ReportingAgent
 from agents.sql_agent import SQLAgent
-from security.models import UserRole
-from security.schema_policy import (
-    SchemaPolicyValidator,
-)
-
-from database.db_manager import DatabaseManager
-from database.schema_manager import SchemaManager
-
-
 from security.output_guard import OutputGuard
 
 from models.schemas import (
     AnalysisPlan,
     IntentResult,
+    QueryExecutionResult,
 )
 
 from tools.sql_execution_tool import (
     SQLExecutionOutcome,
-    SQLExecutionTool,
 )
-from tools.sql_validator import SQLValidator
 from security.input_guard import InputGuard
 from security.prompt_injection_guard import (
     PromptInjectionGuard,
 )
 from security.models import (
-    DeterministicValidationResult,
     InputGuardResult,
-    OutputEvaluation,
-    OutputGuardResult,
     PromptRiskAssessment,
     UserRole,
 )
@@ -72,11 +47,16 @@ from evaluation.deterministic_validator import (
 from evaluation.llm_evaluator import (
     LLMOutputEvaluator,
 )
+from evaluation.unified_evaluator import (
+    UnifiedOutputEvaluator,
+)
 
 from workflow.state import (
     GraphState,
     add_trace_event,
 )
+from mcp_layer.client import InternalMCPClient
+from langgraph.types import interrupt
 
 def enum_value(
     value: Any,
@@ -127,12 +107,8 @@ class WorkflowNodes:
     sql_agent: SQLAgent,
     analysis_agent: AnalysisAgent,
     reporting_agent: ReportingAgent,
-    deterministic_validator: DeterministicOutputValidator,
-    llm_output_evaluator: LLMOutputEvaluator,
-    output_guard: OutputGuard,
-    database_manager: DatabaseManager,
-    schema_manager: SchemaManager,
-    sql_execution_tool: SQLExecutionTool,
+    unified_output_evaluator: UnifiedOutputEvaluator,
+    mcp_client: InternalMCPClient,
 ) -> None:
 
         """
@@ -200,57 +176,17 @@ class WorkflowNodes:
             )   
 
         if not isinstance(
-            deterministic_validator,
-            DeterministicOutputValidator,
+            unified_output_evaluator,
+            UnifiedOutputEvaluator,
         ):
             raise TypeError(
-                "deterministic_validator must be a "
-                "DeterministicOutputValidator instance."
+                "unified_output_evaluator must be a "
+                "UnifiedOutputEvaluator instance."
             )
 
-        if not isinstance(
-            llm_output_evaluator,
-            LLMOutputEvaluator,
-        ):
+        if not isinstance(mcp_client, InternalMCPClient):
             raise TypeError(
-                "llm_output_evaluator must be an "
-                "LLMOutputEvaluator instance."
-            )
-
-        if not isinstance(
-            output_guard,
-            OutputGuard,
-        ):
-            raise TypeError(
-                "output_guard must be an "
-                "OutputGuard instance."
-            )
-
-        if not isinstance(
-            database_manager,
-            DatabaseManager,
-        ):
-            raise TypeError(
-                "database_manager must be a "
-                "DatabaseManager instance."
-            )
-
-        if not isinstance(
-            schema_manager,
-            SchemaManager,
-        ):
-            raise TypeError(
-                "schema_manager must be a "
-                "SchemaManager instance."
-            )
-
-        if not isinstance(
-            sql_execution_tool,
-            SQLExecutionTool,
-        ):
-            raise TypeError(
-                "sql_execution_tool must be a "
-                "SQLExecutionTool instance."
+                "mcp_client must be an InternalMCPClient instance."
             )
 
         self.input_guard = input_guard
@@ -264,19 +200,11 @@ class WorkflowNodes:
         self.analysis_agent = analysis_agent
         self.reporting_agent = reporting_agent
 
-        self.deterministic_validator = (
-            deterministic_validator
+        self.unified_output_evaluator = (
+            unified_output_evaluator
         )
 
-        self.llm_output_evaluator = (
-            llm_output_evaluator
-        )
-
-        self.output_guard = output_guard
-
-        self.database_manager = database_manager
-        self.schema_manager = schema_manager
-        self.sql_execution_tool = sql_execution_tool
+        self.mcp_client = mcp_client
 
     def _get_original_question(
         self,
@@ -426,6 +354,7 @@ class WorkflowNodes:
         state: GraphState,
         node_name: str,
         error: Exception,
+        mcp_tool: str | None = None,
     ) -> dict[str, Any]:
         """
         Build a controlled workflow failure update.
@@ -444,6 +373,7 @@ class WorkflowNodes:
                 f"{node_name} failed with "
                 f"{error_type}."
             ),
+            mcp_tool=mcp_tool,
         )
 
         return {
@@ -1002,45 +932,141 @@ class WorkflowNodes:
             state: GraphState,
         ) -> dict[str, Any]:
             """
-            End the current execution with a focused follow-up question.
+            Pause the current thread and screen the resumed answer.
             """
 
             node_name = "clarification"
 
-            clarification_question = (
-                state.get(
-                    "clarification_question"
-                )
+            clarification_question = state.get(
+                "clarification_question"
             )
-
-            if not isinstance(
-                clarification_question,
-                str,
-            ) or not clarification_question.strip():
+            if (
+                not isinstance(clarification_question, str)
+                or not clarification_question.strip()
+            ):
                 clarification_question = (
                     "What metric would you like to analyze, "
-                    "and how should the results be grouped "
-                    "or filtered?"
+                    "and how should the results be grouped or filtered?"
                 )
 
+            answer = interrupt(
+                {
+                    "question": clarification_question,
+                    "message": (
+                        "Additional analytical context is required."
+                    ),
+                }
+            )
+            if not isinstance(answer, str) or not answer.strip():
+                return self._error_update(
+                    state=state,
+                    node_name=node_name,
+                    error=ValueError(
+                        "A non-empty clarification answer is required."
+                    ),
+                )
+
+            answer_guard = self.input_guard.evaluate(answer.strip())
+            answer_decision = enum_value(answer_guard.decision)
+            if answer_decision in {"block", "review"}:
+                status = (
+                    "security_blocked"
+                    if answer_decision == "block"
+                    else "security_review_required"
+                )
+                trace = add_trace_event(
+                    state=state,
+                    node=node_name,
+                    status=answer_decision,
+                    message=(
+                        "The clarification answer did not pass "
+                        "input-security screening."
+                    ),
+                )
+                return {
+                    "input_guard_result": answer_guard,
+                    "security_decision": answer_decision,
+                    "security_message": answer_guard.user_message,
+                    "security_review_required": answer_decision == "review",
+                    "workflow_status": status,
+                    "current_node": node_name,
+                    "error_type": None,
+                    "error_message": None,
+                    "execution_trace": trace,
+                }
+
+            safe_answer = answer_guard.sanitized_question
+            if not isinstance(safe_answer, str) or not safe_answer.strip():
+                raise RuntimeError(
+                    "Input security screening returned no safe clarification."
+                )
+            safe_answer = safe_answer.strip()
+            prompt_assessment = self.prompt_injection_guard.assess(
+                question=safe_answer,
+                deterministic_result=answer_guard,
+            )
+            prompt_decision = enum_value(prompt_assessment.decision)
+            if prompt_decision in {"block", "review"}:
+                status = (
+                    "security_blocked"
+                    if prompt_decision == "block"
+                    else "security_review_required"
+                )
+                trace = add_trace_event(
+                    state=state,
+                    node=node_name,
+                    status=prompt_decision,
+                    message=(
+                        "The clarification answer did not pass "
+                        "prompt-risk screening."
+                    ),
+                )
+                return {
+                    "input_guard_result": answer_guard,
+                    "prompt_risk_assessment": prompt_assessment,
+                    "security_decision": prompt_decision,
+                    "security_message": (
+                        "The clarification answer requires security "
+                        "review before analytical processing."
+                    ),
+                    "security_review_required": prompt_decision == "review",
+                    "workflow_status": status,
+                    "current_node": node_name,
+                    "error_type": None,
+                    "error_message": None,
+                    "execution_trace": trace,
+                }
+
+            current_question = self._get_required_question(state)
+            combined_question = (
+                f"{current_question}\n\nAdditional context: {safe_answer}"
+            )
             trace = add_trace_event(
                 state=state,
                 node=node_name,
-                status="waiting_for_user",
+                status="resumed",
                 message=(
-                    "Workflow paused because additional "
-                    "analytical context is required."
+                    "The clarification answer passed security screening; "
+                    "intent analysis is resuming."
                 ),
             )
-
             return {
-                "clarification_required": True,
-                "clarification_question": (
-                    clarification_question
+                "user_question": combined_question,
+                "input_guard_result": answer_guard,
+                "prompt_risk_assessment": prompt_assessment,
+                "security_decision": (
+                    "allow_redacted"
+                    if answer_decision == "allow_redacted"
+                    else "allow"
                 ),
-                "workflow_status": (
-                    "clarification_required"
+                "security_message": (
+                    "The clarification answer passed security screening."
                 ),
+                "security_review_required": False,
+                "intent": None,
+                "clarification_required": False,
+                "clarification_question": None,
+                "workflow_status": "understanding_intent",
                 "current_node": node_name,
                 "error_type": None,
                 "error_message": None,
@@ -1122,45 +1148,21 @@ class WorkflowNodes:
         """
 
         node_name = "schema_manager"
+        mcp_tool_called = False
 
         try:
-            connection_status = (
-                self.database_manager
-                .test_connection()
+            mcp_tool_called = True
+            result = self.mcp_client.call_tool(
+                "get_approved_schema",
+                {},
             )
+            database_schema = result.get("schema")
 
-            if not connection_status:
-                raise ConnectionError(
-                    "Database connection test failed."
-                )
-
-            integrity_status = (
-                self.database_manager
-                .run_integrity_check()
-            )
-
-            if integrity_status.lower() != "ok":
+            if not isinstance(database_schema, str) or not database_schema.strip():
                 raise RuntimeError(
-                    "Database integrity check failed: "
-                    f"{integrity_status}"
+                    "The approved schema tool returned no schema."
                 )
-
-            database_schema = (
-                self.schema_manager
-                .get_schema_prompt(
-                    include_views=False
-                )
-            )
-
-            cleaned_schema = (
-                database_schema.strip()
-            )
-
-            if not cleaned_schema:
-                raise RuntimeError(
-                    "SchemaManager returned an "
-                    "empty database schema."
-                )
+            cleaned_schema = database_schema.strip()
 
             trace = add_trace_event(
                 state=state,
@@ -1170,6 +1172,7 @@ class WorkflowNodes:
                     "Database verified and schema "
                     "prepared for SQL generation."
                 ),
+                mcp_tool="get_approved_schema",
             )
 
             return {
@@ -1188,6 +1191,11 @@ class WorkflowNodes:
                 state=state,
                 node_name=node_name,
                 error=exc,
+                mcp_tool=(
+                    "get_approved_schema"
+                    if mcp_tool_called
+                    else None
+                ),
             )
 
     def _build_sql_retry_feedback(
@@ -1435,6 +1443,7 @@ class WorkflowNodes:
                 f"'{outcome.stage}'. "
                 f"Retry count is {next_retry_count}."
             ),
+            mcp_tool="execute_validated_read_query",
         )
 
         return {
@@ -1476,6 +1485,7 @@ class WorkflowNodes:
         node_name = (
             "sql_validation_execution"
         )
+        mcp_tool_called = False
 
         try:
             generated_sql = state.get(
@@ -1500,30 +1510,78 @@ class WorkflowNodes:
                     "GraphState generated SQL is empty."
                 )
 
-            outcome = (
-                self.sql_execution_tool
-                .validate_and_execute(
-                    cleaned_sql
-                )
+            intent = self._get_required_intent(state)
+            plan = self._get_required_plan(state)
+            mcp_tool_called = True
+            tool_result = self.mcp_client.call_tool(
+                "execute_validated_read_query",
+                {
+                    "sql": cleaned_sql,
+                    "intent_json": intent.model_dump_json(),
+                    "plan_json": plan.model_dump_json(),
+                },
             )
 
-            if not outcome.success:
-                if outcome.retryable:
+            if not isinstance(tool_result, dict):
+                raise TypeError(
+                    "The validated-query MCP tool returned an invalid result."
+                )
+
+            if tool_result.get("success") is not True:
+                retryable = tool_result.get("retryable") is True
+                outcome = SQLExecutionOutcome(
+                    success=False,
+                    validated_sql=None,
+                    validation_result=None,
+                    query_result=None,
+                    validation_errors=list(
+                        tool_result.get("validation_errors", [])
+                    ),
+                    execution_error=tool_result.get("execution_error"),
+                    retryable=retryable,
+                    stage=str(tool_result.get("stage", "validation")),
+                )
+                if retryable:
                     return self._sql_retry_update(
                         state=state,
                         outcome=outcome,
                     )
+                if tool_result.get("security_violation") is True:
+                    trace = add_trace_event(
+                        state=state,
+                        node=node_name,
+                        status="blocked",
+                        message=(
+                            "SQL access was blocked by schema "
+                            "and privacy policy."
+                        ),
+                        mcp_tool="execute_validated_read_query",
+                    )
+                    return {
+                        "sql_validation_errors": [],
+                        "sql_execution_error": None,
+                        "security_decision": "block",
+                        "security_message": (
+                            "The query was blocked by database access policy."
+                        ),
+                        "workflow_status": "security_blocked",
+                        "current_node": node_name,
+                        "execution_trace": trace,
+                    }
 
                 raise RuntimeError(
                     "Agent 3b rejected the SQL with "
                     "a non-retryable error."
                 )
 
-            if outcome.query_result is None:
+            query_payload = tool_result.get("query_result")
+            if not isinstance(query_payload, dict):
                 raise RuntimeError(
-                    "Agent 3b reported success but "
-                    "returned no query result."
+                    "The validated-query MCP tool returned no query result."
                 )
+            query_result = QueryExecutionResult.model_validate(
+                query_payload
+            )
 
             trace = add_trace_event(
                 state=state,
@@ -1533,11 +1591,12 @@ class WorkflowNodes:
                     "SQL passed independent validation "
                     "and executed successfully."
                 ),
+                mcp_tool="execute_validated_read_query",
             )
 
             return {
                 "query_result": (
-                    outcome.query_result
+                    query_result
                 ),
                 "sql_validation_errors": [],
                 "sql_execution_error": None,
@@ -1553,6 +1612,11 @@ class WorkflowNodes:
                 state=state,
                 node_name=node_name,
                 error=exc,
+                mcp_tool=(
+                    "execute_validated_read_query"
+                    if mcp_tool_called
+                    else None
+                ),
             )
 
     def analysis_node(
@@ -1720,40 +1784,10 @@ class WorkflowNodes:
                     "Report regeneration limit was exceeded."
                 )
 
-            previous_validation = state.get(
-                "deterministic_validation_result"
+            validation_issues = state.get(
+                "report_validation_feedback",
+                [],
             )
-
-            validation_issues = None
-
-            if (
-                regeneration_count > 0
-                and isinstance(
-                    previous_validation,
-                    DeterministicValidationResult,
-                )
-            ):
-                validation_issues = list(
-                    previous_validation.issues
-                )
-
-                for numeric_claim in (
-                    previous_validation.numeric_claims
-                ):
-                    if numeric_claim.supported:
-                        continue
-
-                    claim_detail = (
-                        f"Unsupported numerical claim: "
-                        f"{numeric_claim.claim}"
-                    )
-                    if numeric_claim.claimed_value is not None:
-                        claim_detail += (
-                            f" (claimed value: "
-                            f"{numeric_claim.claimed_value})"
-                        )
-
-                    validation_issues.append(claim_detail)
 
             report_arguments = {
                 "user_question": question,
@@ -1793,6 +1827,8 @@ class WorkflowNodes:
                 "output_evaluation": None,
                 "output_guard_result": None,
                 "sanitized_output_payload": None,
+                "unified_output_decision": None,
+                "report_validation_feedback": [],
                 "report_regeneration_count": (
                     regeneration_count
                 ),
@@ -1880,155 +1916,107 @@ class WorkflowNodes:
             ),
         }
 
-    def deterministic_validation_node(
+    def unified_output_evaluator_node(
         self,
         state: GraphState,
     ) -> dict[str, Any]:
-        """
-        Validate Agent 5 output using objective checks.
-
-        Reads:
-            user_question
-            generated_sql
-            query_result
-            analysis_result
-            final_report
-
-        Writes:
-            deterministic_validation_result
-            workflow_status
-            output_validation_message
-            execution_trace
-        """
-
-        node_name = (
-            "deterministic_output_validation"
-        )
+        """Perform all post-Agent-5 validation and protection."""
+        node_name = "unified_output_evaluator"
 
         try:
-            question = self._get_required_question(
-                state
-            )
+            question = self._get_required_question(state)
+            generated_sql = state.get("generated_sql")
+            query_result = state.get("query_result")
+            analysis_result = state.get("analysis_result")
+            final_report = state.get("final_report")
 
-            generated_sql = state.get(
-                "generated_sql"
-            )
-
-            if not isinstance(
-                generated_sql,
-                str,
-            ) or not generated_sql.strip():
+            if not isinstance(generated_sql, str) or not generated_sql.strip():
                 raise ValueError(
-                    "Deterministic validation requires "
-                    "generated SQL."
+                    "Unified evaluation requires generated SQL."
                 )
-
-            query_result = state.get(
-                "query_result"
-            )
-
-            if query_result is None:
+            if not isinstance(query_result, QueryExecutionResult):
                 raise ValueError(
-                    "Deterministic validation requires "
-                    "QueryExecutionResult."
+                    "Unified evaluation requires QueryExecutionResult."
                 )
-
-            analysis_result = state.get(
-                "analysis_result"
-            )
-
             if analysis_result is None:
                 raise ValueError(
-                    "Deterministic validation requires "
-                    "AnalysisResult."
+                    "Unified evaluation requires AnalysisResult."
                 )
-
-            final_report = state.get(
-                "final_report"
-            )
-
             if final_report is None:
                 raise ValueError(
-                    "Deterministic validation requires "
-                    "FinalReport."
+                    "Unified evaluation requires FinalReport."
                 )
 
-            validation_result = (
-                self.deterministic_validator.validate(
+            evaluation_result = (
+                self.unified_output_evaluator.evaluate(
                     user_question=question,
                     generated_sql=generated_sql,
                     query_result=query_result,
                     analysis_result=analysis_result,
                     final_report=final_report,
+                    allowed_output_columns=set(query_result.columns),
+                    technical_details=(
+                        self._build_output_technical_details(state)
+                    ),
                 )
             )
+            decision = evaluation_result.decision
+            regeneration_count = state.get(
+                "report_regeneration_count",
+                0,
+            )
+            maximum_regenerations = state.get(
+                "max_report_regenerations",
+                0,
+            )
 
-            if not isinstance(
-                validation_result,
-                DeterministicValidationResult,
+            if (
+                decision == "regenerate"
+                and regeneration_count >= maximum_regenerations
             ):
-                raise TypeError(
-                    "DeterministicOutputValidator did not "
-                    "return DeterministicValidationResult."
-                )
+                decision = "review"
 
-            decision = enum_value(
-                validation_result.decision
-            )
-
-            if decision == "approve":
-                workflow_status = (
-                    "evaluating_output"
-                )
-
+            if decision in {"allow", "allow_redacted"}:
+                workflow_status = "completed"
                 trace_status = "completed"
-
                 trace_message = (
-                    "The report passed deterministic "
-                    "output validation."
+                    "The report passed unified quality and security checks."
+                    if decision == "allow"
+                    else (
+                        "The report passed unified checks after "
+                        "deterministic redaction."
+                    )
                 )
-
                 validation_message = (
-                    "Deterministic output validation passed."
+                    evaluation_result.guard_result.user_message
                 )
-
             elif decision == "block":
-                workflow_status = (
-                    "output_blocked"
-                )
-
+                workflow_status = "output_blocked"
                 trace_status = "blocked"
-
                 trace_message = (
-                    "The report was blocked by deterministic "
-                    "output validation."
+                    "The report was blocked by output security controls."
                 )
-
                 validation_message = (
-                    "The generated report contains an unsafe "
-                    "or unauthorized output."
+                    evaluation_result.guard_result.user_message
                 )
-
+            elif decision == "regenerate":
+                workflow_status = "regenerating_report"
+                trace_status = "regenerating"
+                trace_message = (
+                    "The report is being regenerated after validation."
+                )
+                validation_message = (
+                    "The report needs correction before it can be returned."
+                )
             else:
-                # Regeneration is not connected yet. Until the bounded
-                # retry route is added, regeneration or review decisions
-                # stop safely for review.
-                workflow_status = (
-                    "output_review_required"
-                )
-
-                trace_status = (
-                    "review_required"
-                )
-
+                workflow_status = "output_review_required"
+                trace_status = "review_required"
                 trace_message = (
-                    "The report requires correction or "
-                    "quality review."
+                    "The report requires controlled quality review."
                 )
-
                 validation_message = (
-                    "The generated report did not satisfy "
-                    "all deterministic quality checks."
+                    "The report could not be approved within the "
+                    "allowed regeneration attempts."
                 )
 
             trace = add_trace_event(
@@ -2037,398 +2025,41 @@ class WorkflowNodes:
                 status=trace_status,
                 message=trace_message,
             )
+            guard_result = evaluation_result.guard_result
 
             return {
                 "deterministic_validation_result": (
-                    validation_result
+                    evaluation_result.deterministic_result
                 ),
-                "output_validation_message": (
-                    validation_message
+                "output_evaluation": (
+                    evaluation_result.semantic_result
                 ),
-                "workflow_status": (
-                    workflow_status
-                ),
-                "current_node": node_name,
-                "error_type": None,
-                "error_message": None,
-                "execution_trace": trace,
-            }
-
-        except Exception as exc:
-            return self._error_update(
-                state=state,
-                node_name=node_name,
-                error=exc,
-            )
-
-    def llm_output_evaluation_node(
-            self,
-            state: GraphState,
-        ) -> dict[str, Any]:
-            """
-            Evaluate report relevance, groundedness, accuracy, and safety.
-
-            This node runs only after deterministic validation approves the
-            report.
-            """
-
-            node_name = "llm_output_evaluation"
-
-            try:
-                question = self._get_required_question(
-                    state
-                )
-
-                generated_sql = state.get(
-                    "generated_sql"
-                )
-
-                if not isinstance(
-                    generated_sql,
-                    str,
-                ) or not generated_sql.strip():
-                    raise ValueError(
-                        "LLM output evaluation requires "
-                        "generated SQL."
-                    )
-
-                query_result = state.get(
-                    "query_result"
-                )
-
-                if query_result is None:
-                    raise ValueError(
-                        "LLM output evaluation requires "
-                        "QueryExecutionResult."
-                    )
-
-                analysis_result = state.get(
-                    "analysis_result"
-                )
-
-                if analysis_result is None:
-                    raise ValueError(
-                        "LLM output evaluation requires "
-                        "AnalysisResult."
-                    )
-
-                final_report = state.get(
-                    "final_report"
-                )
-
-                if final_report is None:
-                    raise ValueError(
-                        "LLM output evaluation requires "
-                        "FinalReport."
-                    )
-
-                deterministic_result = state.get(
-                    "deterministic_validation_result"
-                )
-
-                if not isinstance(
-                    deterministic_result,
-                    DeterministicValidationResult,
-                ):
-                    raise ValueError(
-                        "LLM output evaluation requires "
-                        "DeterministicValidationResult."
-                    )
-
-                evaluation = (
-                    self.llm_output_evaluator.evaluate(
-                        user_question=question,
-                        generated_sql=generated_sql,
-                        query_result=query_result,
-                        analysis_result=analysis_result,
-                        final_report=final_report,
-                        deterministic_result=(
-                            deterministic_result
-                        ),
-                    )
-                )
-
-                if not isinstance(
-                    evaluation,
-                    OutputEvaluation,
-                ):
-                    raise TypeError(
-                        "LLMOutputEvaluator did not return "
-                        "OutputEvaluation."
-                    )
-
-                decision = enum_value(
-                    evaluation.decision
-                )
-
-                if decision == "approve":
-                    workflow_status = (
-                        "guarding_output"
-                    )
-
-                    trace_status = "completed"
-
-                    trace_message = (
-                        "The report passed semantic output "
-                        "quality evaluation."
-                    )
-
-                    validation_message = (
-                        "LLM output evaluation approved "
-                        "the report."
-                    )
-
-                elif decision == "block":
-                    workflow_status = (
-                        "output_blocked"
-                    )
-
-                    trace_status = "blocked"
-
-                    trace_message = (
-                        "The report was blocked by semantic "
-                        "output evaluation."
-                    )
-
-                    validation_message = (
-                        "The generated report contains an unsafe "
-                        "or ungrounded output."
-                    )
-
-                else:
-                    workflow_status = (
-                        "output_review_required"
-                    )
-
-                    trace_status = (
-                        "review_required"
-                    )
-
-                    trace_message = (
-                        "The report requires correction or "
-                        "quality review after semantic evaluation."
-                    )
-
-                    validation_message = (
-                        "The generated report did not satisfy "
-                        "all semantic quality thresholds."
-                    )
-
-                trace = add_trace_event(
-                    state=state,
-                    node=node_name,
-                    status=trace_status,
-                    message=trace_message,
-                )
-
-                return {
-                    "output_evaluation": evaluation,
-                    "output_validation_message": (
-                        validation_message
-                    ),
-                    "workflow_status": (
-                        workflow_status
-                    ),
-                    "current_node": node_name,
-                    "error_type": None,
-                    "error_message": None,
-                    "execution_trace": trace,
-                }
-
-            except Exception as exc:
-                return self._error_update(
-                    state=state,
-                    node_name=node_name,
-                    error=exc,
-                )
-
-    def output_guard_node(
-        self,
-        state: GraphState,
-    ) -> dict[str, Any]:
-        """
-        Apply final privacy, secret, authorization, and redaction checks.
-
-        The current workflow uses the analyst role until authentication
-        and role-based identity are integrated.
-        """
-
-        node_name = "output_guard"
-
-        try:
-            final_report = state.get(
-                "final_report"
-            )
-
-            if final_report is None:
-                raise ValueError(
-                    "OutputGuard requires FinalReport."
-                )
-
-            query_result = state.get(
-                "query_result"
-            )
-
-            if query_result is None:
-                raise ValueError(
-                    "OutputGuard requires "
-                    "QueryExecutionResult."
-                )
-
-            deterministic_result = state.get(
-                "deterministic_validation_result"
-            )
-
-            if not isinstance(
-                deterministic_result,
-                DeterministicValidationResult,
-            ):
-                raise ValueError(
-                    "OutputGuard requires "
-                    "DeterministicValidationResult."
-                )
-
-            output_evaluation = state.get(
-                "output_evaluation"
-            )
-
-            if not isinstance(
-                output_evaluation,
-                OutputEvaluation,
-            ):
-                raise ValueError(
-                    "OutputGuard requires "
-                    "OutputEvaluation."
-                )
-
-            # Agent 3b already returned only validated output columns.
-            # Schema-policy-specific redaction can later narrow this set.
-            allowed_output_columns = set(
-                query_result.columns
-            )
-
-            guard_result = (
-                self.output_guard.guard(
-                    final_report=final_report,
-                    query_result=query_result,
-                    deterministic_result=(
-                        deterministic_result
-                    ),
-                    output_evaluation=(
-                        output_evaluation
-                    ),
-                    role=UserRole.ANALYST,
-                    allowed_output_columns=(
-                        allowed_output_columns
-                    ),
-                    technical_details=(
-                        self._build_output_technical_details(
-                            state
-                        )
-                    ),
-                )
-            )
-
-            if not isinstance(
-                guard_result,
-                OutputGuardResult,
-            ):
-                raise TypeError(
-                    "OutputGuard did not return "
-                    "OutputGuardResult."
-                )
-
-            decision = enum_value(
-                guard_result.decision
-            )
-
-            if decision in {
-                "allow",
-                "allow_redacted",
-            }:
-                if (
-                    guard_result
-                    .sanitized_payload
-                    is None
-                ):
-                    raise RuntimeError(
-                        "OutputGuard approved the output "
-                        "without a sanitized payload."
-                    )
-
-                workflow_status = "completed"
-
-                trace_status = "completed"
-
-                trace_message = (
-                    "The final response passed output "
-                    "security screening."
-                    if decision == "allow"
-                    else (
-                        "The final response passed output "
-                        "security screening after redaction."
-                    )
-                )
-
-            elif decision == "block":
-                workflow_status = (
-                    "output_blocked"
-                )
-
-                trace_status = "blocked"
-
-                trace_message = (
-                    "The final response was blocked by "
-                    "output security controls."
-                )
-
-            else:
-                workflow_status = (
-                    "output_review_required"
-                )
-
-                trace_status = (
-                    "review_required"
-                )
-
-                trace_message = (
-                    "The final response requires security "
-                    "or quality review."
-                )
-
-            trace = add_trace_event(
-                state=state,
-                node=node_name,
-                status=trace_status,
-                message=trace_message,
-            )
-
-            return {
-                "output_guard_result": (
-                    guard_result
-                ),
+                "output_guard_result": guard_result,
                 "sanitized_output_payload": (
-                    guard_result
-                    .sanitized_payload
+                    guard_result.sanitized_payload
                 ),
-                "output_validation_message": (
-                    guard_result.user_message
+                "unified_output_decision": decision,
+                "report_validation_feedback": (
+                    evaluation_result.validation_feedback
+                    if decision == "regenerate"
+                    else []
                 ),
-                "workflow_status": (
-                    workflow_status
-                ),
+                "output_validation_message": validation_message,
+                "workflow_status": workflow_status,
                 "current_node": node_name,
                 "error_type": None,
                 "error_message": None,
                 "execution_trace": trace,
             }
-
         except Exception as exc:
             return self._error_update(
                 state=state,
                 node_name=node_name,
                 error=exc,
             )
+
+
+
 
     def security_block_node(
             self,
@@ -2620,7 +2251,9 @@ class WorkflowNodes:
         }
 
 
-def build_workflow_nodes() -> WorkflowNodes:
+def build_workflow_nodes(
+    mcp_client: InternalMCPClient,
+) -> WorkflowNodes:
     """
     Build all current workflow nodes.
 
@@ -2634,14 +2267,6 @@ def build_workflow_nodes() -> WorkflowNodes:
 
     Database access remains read-only.
     """
-
-    database_manager = DatabaseManager(
-        max_rows=1000,
-    )
-
-    schema_manager = SchemaManager(
-        database_manager=database_manager
-    )
 
     input_guard = InputGuard()
 
@@ -2717,28 +2342,12 @@ def build_workflow_nodes() -> WorkflowNodes:
     output_guard = OutputGuard(
         maximum_output_rows=1000
     )
-    sql_validator = SQLValidator(
-        dialect="sqlite"
-    )
-
-    schema_policy_validator = (
-        SchemaPolicyValidator(
-            database_manager=database_manager,
-            sql_validator=sql_validator,
-            maximum_result_rows=1000,
-        )
-    )
-
-    sql_execution_tool = SQLExecutionTool(
-        database_manager=database_manager,
-        sql_validator=sql_validator,
-        schema_policy_validator=(
-            schema_policy_validator
-        ),
+    unified_output_evaluator = UnifiedOutputEvaluator(
+        deterministic_checks=deterministic_validator,
+        semantic_judge=llm_output_evaluator,
+        output_sanitizer=output_guard,
         role=UserRole.ANALYST,
-        explain_before_execution=True,
     )
-
     return WorkflowNodes(
     input_guard=input_guard,
     prompt_injection_guard=(
@@ -2749,376 +2358,8 @@ def build_workflow_nodes() -> WorkflowNodes:
     sql_agent=sql_agent,
     analysis_agent=analysis_agent,
     reporting_agent=reporting_agent,
-    deterministic_validator=(
-        deterministic_validator
+    unified_output_evaluator=(
+        unified_output_evaluator
     ),
-    llm_output_evaluator=(
-        llm_output_evaluator
-    ),
-    output_guard=output_guard,
-    database_manager=database_manager,
-    schema_manager=schema_manager,
-    sql_execution_tool=sql_execution_tool,
+    mcp_client=mcp_client,
 )
-
-def main() -> None:
-    """
-    Run all currently implemented nodes sequentially.
-
-    This smoke test does not yet compile the retry loop in LangGraph.
-    """
-
-    from workflow.state import (
-        create_initial_state,
-    )
-
-    print("=" * 80)
-    print("WORKFLOW NODES SMOKE TEST")
-    print("=" * 80)
-
-    question = (
-        "Show the top 5 products by revenue."
-    )
-
-    try:
-        nodes = build_workflow_nodes()
-
-        state = create_initial_state(
-            user_question=question,
-            max_sql_retries=3,
-        )
-
-        print(f"Question: {question}")
-
-        node_sequence = [
-            (
-                "Input Guard",
-                nodes.input_guard_node,
-            ),
-            (
-                "Prompt Injection Guard",
-                nodes.prompt_injection_guard_node,
-            ),
-            (
-                "Agent 1",
-                nodes.intent_node,
-            ),
-            (
-                "Agent 2",
-                nodes.planning_node,
-            ),
-            (
-                "Schema Manager",
-                nodes.schema_node,
-            ),
-            (
-                "Agent 3a",
-                nodes.sql_generation_node,
-            ),
-            (
-                "Agent 3b",
-                nodes.sql_validation_execution_node,
-            ),
-            (
-                "Agent 4",
-                nodes.analysis_node,
-            ),
-            (
-                "Agent 5",
-                nodes.reporting_node,
-            ),
-
-            (
-                "Deterministic Output Validation",
-                nodes.deterministic_validation_node,
-            ),
-            (
-                "LLM Output Evaluation",
-                nodes.llm_output_evaluation_node,
-            ),
-            (
-                "Final Output Guard",
-                nodes.output_guard_node,
-            ),
-        ]
-
-        for display_name, node_function in (
-            node_sequence
-        ):
-            if state.get(
-                "workflow_status"
-            ) == "failed":
-                break
-
-            if (
-                display_name != "Agent 1"
-                and state.get(
-                    "clarification_required",
-                    False,
-                )
-            ):
-                break
-
-            print(
-                f"\nRunning {display_name}..."
-            )
-
-            update = node_function(state)
-            state.update(update)
-
-            if state.get(
-                "workflow_status"
-            ) in {
-                "output_blocked",
-                "output_review_required",
-            }:
-                break
-
-            if (
-                state.get("workflow_status")
-                == "security_blocked"
-            ):
-                block_update = (
-                    nodes.security_block_node(
-                        state
-                    )
-                )
-
-                state.update(block_update)
-                break
-
-            if (
-                state.get("workflow_status")
-                == "security_review_required"
-            ):
-                review_update = (
-                    nodes.security_review_node(
-                        state
-                    )
-                )
-                state.update(review_update)
-                break
-
-            if (
-                state.get("workflow_status")
-                == "retrying_sql"
-            ):
-                break
-
-            print(
-                f"Status: "
-                f"{state.get('workflow_status')}"
-            )
-
-        if state.get(
-            "clarification_required",
-            False,
-        ):
-            print(
-                "\nClarification question:"
-            )
-            print(
-                state.get(
-                    "clarification_question"
-                )
-            )
-
-        elif state.get(
-            "workflow_status"
-        ) == "security_blocked":
-            print("\n" + "=" * 80)
-            print(
-                "RESULT: REQUEST BLOCKED BY SECURITY POLICY"
-            )
-            print("=" * 80)
-            print(
-                state.get(
-                    "security_message",
-                    (
-                        "The request was blocked "
-                        "by security policy."
-                    ),
-                )
-            )
-
-        elif state.get(
-            "workflow_status"
-        ) == "security_review_required":
-            print("\n" + "=" * 80)
-            print(
-                "RESULT: SECURITY REVIEW REQUIRED"
-            )
-            print("=" * 80)
-            print(
-                state.get(
-                    "security_message",
-                    (
-                        "The request requires security review "
-                        "before analytical processing."
-                    ),
-                )
-            )
-
-        elif state.get(
-            "workflow_status"
-        ) == "retrying_sql":
-            print(
-                "\nAgent 3b requested SQL retry."
-            )
-            print(
-                f"Retry count: "
-                f"{state.get('sql_retry_count')}"
-            )
-            print(
-                f"Validation errors: "
-                f"{state.get('sql_validation_errors')}"
-            )
-            print(
-                f"Execution error: "
-                f"{state.get('sql_execution_error')}"
-            )
-
-        elif state.get(
-            "workflow_status"
-        ) == "failed":
-            raise RuntimeError(
-                state.get(
-                    "error_message",
-                    "Workflow nodes failed.",
-                )
-            )
-
-        else:
-            query_result = state.get(
-                "query_result"
-            )
-
-            if query_result is None:
-                raise RuntimeError(
-                    "Agent 3b returned no query result."
-                )
-
-            print("\nGenerated SQL:")
-            print(
-                state.get(
-                    "generated_sql"
-                )
-            )
-
-            print("\nQuery result:")
-            print(
-                f"Columns       : "
-                f"{query_result.columns}"
-            )
-            print(
-                f"Rows returned : "
-                f"{query_result.row_count}"
-            )
-            print(
-                f"Truncated     : "
-                f"{query_result.truncated}"
-            )
-
-            for row in query_result.rows:
-                print(row)
-
-            analysis_result = state.get(
-    "analysis_result"
-)
-
-            if analysis_result is not None:
-                print("\nAnalysis result:")
-                print(
-        analysis_result.model_dump_json(
-            indent=2
-        )
-    )
-
-            final_report = state.get(
-                "final_report"
-            )
-
-            if final_report is not None:
-                print("\nFinal report:")
-                print(
-                    final_report.model_dump_json(
-                        indent=2
-                    )
-                )
-
-        deterministic_result = state.get(
-            "deterministic_validation_result"
-        )
-
-        if deterministic_result is not None:
-            print("\nDeterministic validation:")
-            print(
-                deterministic_result.model_dump_json(
-                    indent=2
-                )
-            )
-
-        output_evaluation = state.get(
-            "output_evaluation"
-        )
-
-        if output_evaluation is not None:
-            print("\nLLM output evaluation:")
-            print(
-                output_evaluation.model_dump_json(
-                    indent=2
-                )
-            )
-
-        output_guard_result = state.get(
-            "output_guard_result"
-        )
-
-        if output_guard_result is not None:
-            print("\nOutput guard:")
-            print(
-                f"Decision : "
-                f"{output_guard_result.decision}"
-            )
-            print(
-                f"Message  : "
-                f"{output_guard_result.user_message}"
-            )
-            print(
-                f"Redactions: "
-                f"{len(output_guard_result.redactions)}"
-            )
-
-        print(
-            f"\nFinal status: "
-            f"{state.get('workflow_status')}"
-        )
-
-        print("\nExecution trace:")
-
-        for event in state.get(
-            "execution_trace",
-            [],
-        ):
-            print(
-                f"- {event['node']} | "
-                f"{event['status']} | "
-                f"{event['message']}"
-            )
-
-        print("\n" + "=" * 80)
-        print("RESULT: WORKFLOW NODES ARE WORKING")
-        print("=" * 80)
-
-    except Exception as exc:
-        print("\n" + "=" * 80)
-        print("RESULT: WORKFLOW NODES FAILED")
-        print("=" * 80)
-        print(
-            f"{type(exc).__name__}: {exc}"
-        )
-        raise SystemExit(1) from exc
-
-
-if __name__ == "__main__":
-    main()

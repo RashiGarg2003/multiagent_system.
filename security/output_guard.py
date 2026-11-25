@@ -149,6 +149,7 @@ class OutputGuard:
             "max_sql_retries",
             "intent",
             "plan",
+            "execution_trace",
         },
         UserRole.ADMIN: {
             "generated_sql",
@@ -993,18 +994,28 @@ class OutputGuard:
             not query_valid
         )
 
-        if authoritative_decision is not None:
-            decision = (
-                authoritative_decision
-            )
-
-        elif (
+        if (
             secret_detected
             or restricted_detected
             or prompt_leakage
             or contains_unauthorized_fields
         ):
             decision = SecurityDecision.BLOCK
+
+        elif (
+            redactions
+            and authoritative_decision
+            == SecurityDecision.ALLOW
+        ):
+            decision = (
+                SecurityDecision
+                .ALLOW_REDACTED
+            )
+
+        elif authoritative_decision is not None:
+            decision = (
+                authoritative_decision
+            )
 
         elif redactions:
             decision = (
@@ -1105,6 +1116,30 @@ class OutputGuard:
                 )
             ),
             user_message=user_message,
+        )
+
+    def sanitize_internal_value(
+        self,
+        value: Any,
+        location: str,
+    ) -> tuple[Any, bool, bool, bool]:
+        """Return redacted internal evidence and its blocking indicators."""
+        (
+            sanitized,
+            _,
+            _,
+            secret_detected,
+            restricted_detected,
+            prompt_leakage,
+        ) = self._sanitize_value(
+            value=value,
+            location=location,
+        )
+        return (
+            sanitized,
+            secret_detected,
+            restricted_detected,
+            prompt_leakage,
         )
 
     def _payload_text(
